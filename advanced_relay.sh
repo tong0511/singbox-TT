@@ -93,27 +93,167 @@ _check_port_occupied() {
     return 1
 }
 
-# IPTables 规则保存
-_save_iptables_rules() {
-    _info "正在保存 IPTables 规则..."
-    if command -v netfilter-persistent &>/dev/null; then
-        # Debian/Ubuntu: 使用 netfilter-persistent 统一持久化 (含 v4+v6)
-        netfilter-persistent save >/dev/null 2>&1
+_is_pid_running_cmd() {
+    local pid="$1"
+    local pattern="$2"
+    [ -n "$pid" ] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    if [ -r "/proc/${pid}/cmdline" ]; then
+        tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null | grep -Fq "$pattern"
     else
-        # Alpine / 通用方案: 分别保存 v4 和 v6 规则到标准路径
-        if command -v iptables-save &>/dev/null; then
-            mkdir -p /etc/iptables
-            iptables-save > /etc/iptables/rules.v4 2>/dev/null
-        fi
-        if command -v ip6tables-save &>/dev/null; then
-            mkdir -p /etc/iptables
-            ip6tables-save > /etc/iptables/rules.v6 2>/dev/null
-        fi
+        ps -p "$pid" -o args= 2>/dev/null | grep -Fq "$pattern"
     fi
-    # Alpine OpenRC: 尝试使用 rc-service 保存
-    if command -v rc-service &>/dev/null; then
-        rc-service iptables save 2>/dev/null
-        rc-service ip6tables save 2>/dev/null
+}
+
+_is_pid_file_running_cmd() {
+    local pid_file="$1"
+    local pattern="$2"
+    local pid
+    [ -s "$pid_file" ] || return 1
+    pid=$(cat "$pid_file" 2>/dev/null)
+    _is_pid_running_cmd "$pid" "$pattern"
+}
+
+# nftables 规则管理 (独立表，避免污染系统其他防火墙规则)
+NFT_TABLE="${NFT_TABLE:-singboxlite}"
+NFT_PERSIST_FILE="${NFT_PERSIST_FILE:-/etc/nftables.d/singboxlite.nft}"
+
+_nft_ensure_base() {
+    command -v nft &>/dev/null || return 1
+    nft list table inet "$NFT_TABLE" >/dev/null 2>&1 || nft add table inet "$NFT_TABLE" >/dev/null 2>&1 || return 1
+    nft list chain inet "$NFT_TABLE" prerouting >/dev/null 2>&1 || nft add chain inet "$NFT_TABLE" prerouting '{ type nat hook prerouting priority -100; policy accept; }' >/dev/null 2>&1 || return 1
+    nft list chain inet "$NFT_TABLE" output >/dev/null 2>&1 || nft add chain inet "$NFT_TABLE" output '{ type nat hook output priority -100; policy accept; }' >/dev/null 2>&1 || return 1
+    nft list chain inet "$NFT_TABLE" postrouting >/dev/null 2>&1 || nft add chain inet "$NFT_TABLE" postrouting '{ type nat hook postrouting priority 100; policy accept; }' >/dev/null 2>&1 || return 1
+    nft list chain inet "$NFT_TABLE" forward >/dev/null 2>&1 || nft add chain inet "$NFT_TABLE" forward '{ type filter hook forward priority 0; policy accept; }' >/dev/null 2>&1 || return 1
+}
+
+_nft_delete_rules_by_comment() {
+    local comment="$1"
+    local entries chain handle
+    command -v nft &>/dev/null || return 0
+    entries=$(nft -a list table inet "$NFT_TABLE" 2>/dev/null | awk -v c="comment \"$comment\"" '
+        /^[[:space:]]*chain / { chain=$2 }
+        index($0, c) && /# handle / { print chain, $NF }
+    ')
+    [ -z "$entries" ] && return 0
+    while read -r chain handle; do
+        [ -n "$chain" ] && [ -n "$handle" ] && nft delete rule inet "$NFT_TABLE" "$chain" handle "$handle" >/dev/null 2>&1
+    done <<< "$entries"
+}
+
+_nft_port_expr() {
+    local start="$1" end="$2"
+    if [ "$start" = "$end" ]; then
+        echo "$start"
+    else
+        echo "${start}-${end}"
+    fi
+}
+
+_nft_apply_redirect_rule() {
+    local action="$1" start_port="$2" end_port="$3" target_port="$4" comment="$5"
+    if [ "$action" = "delete" ]; then
+        _nft_delete_rules_by_comment "$comment"
+        return 0
+    fi
+    _nft_ensure_base || return 1
+    _nft_delete_rules_by_comment "$comment"
+    nft add rule inet "$NFT_TABLE" prerouting udp dport "$(_nft_port_expr "$start_port" "$end_port")" redirect to ":${target_port}" comment "$comment" >/dev/null 2>&1
+}
+
+_nft_can_redirect() {
+    local test_port="${1:-65530}" target_port="${2:-65531}" comment="singboxlite-test-redirect-$$"
+    _nft_apply_redirect_rule add "$test_port" "$test_port" "$target_port" "$comment" || return 1
+    _nft_apply_redirect_rule delete "$test_port" "$test_port" "$target_port" "$comment"
+    return 0
+}
+
+_find_pf_udp_conflict_in_range() {
+    local start="$1" end="$2"
+    local pf_meta="${RELAY_AUX_DIR}/relay_pf.json"
+    [ -f "$pf_meta" ] || return 1
+    jq -r --argjson start "$start" --argjson end "$end" '
+        to_entries[]
+        | (.key | tonumber?) as $port
+        | select($port != null and $port >= $start and $port <= $end)
+        | select(.value.network == "udp" or .value.network == "tcp+udp")
+        | [
+            .key,
+            (.value.name // "端口转发"),
+            (.value.network_display // .value.network // "UDP"),
+            ((.value.target_addr // "") + ":" + ((.value.target_port // "") | tostring))
+          ]
+        | @tsv
+    ' "$pf_meta" 2>/dev/null | head -n 1
+}
+
+_find_udp_hop_conflict_in_range() {
+    local start="$1" end="$2" exclude_tag="${3:-}"
+    local conflict=""
+    if [ -f "$MAIN_METADATA_FILE" ]; then
+        conflict=$(jq -r --argjson start "$start" --argjson end "$end" --arg exclude "$exclude_tag" '
+            to_entries[]
+            | select(.key != $exclude)
+            | select(.value.portHopping)
+            | (.value.portHopping | capture("^(?<start>[0-9]+)-(?<end>[0-9]+)$")?) as $range
+            | select($range != null)
+            | ($range.start | tonumber) as $other_start
+            | ($range.end | tonumber) as $other_end
+            | select($start <= $other_end and $end >= $other_start)
+            | [
+                .key,
+                (.value.name // .key),
+                .value.portHopping,
+                ("主HY2/" + (.value.portHoppingMode // "unknown"))
+              ]
+            | @tsv
+        ' "$MAIN_METADATA_FILE" 2>/dev/null | head -n 1)
+        [ -n "$conflict" ] && { echo "$conflict"; return 0; }
+    fi
+
+    local relay_links="${RELAY_AUX_DIR}/relay_links.json"
+    if [ -f "$relay_links" ]; then
+        conflict=$(jq -r --argjson start "$start" --argjson end "$end" --arg exclude "$exclude_tag" '
+            to_entries[]
+            | select(.key != $exclude)
+            | select(.value.port_hopping)
+            | (.value.port_hopping | capture("^(?<start>[0-9]+)-(?<end>[0-9]+)$")?) as $range
+            | select($range != null)
+            | ($range.start | tonumber) as $other_start
+            | ($range.end | tonumber) as $other_end
+            | select($start <= $other_end and $end >= $other_start)
+            | [
+                .key,
+                (.value.node_name // .key),
+                .value.port_hopping,
+                "中转HY2/nftables"
+              ]
+            | @tsv
+        ' "$relay_links" 2>/dev/null | head -n 1)
+        [ -n "$conflict" ] && { echo "$conflict"; return 0; }
+    fi
+
+    return 1
+}
+
+_save_nftables_rules() {
+    command -v nft &>/dev/null || return 0
+    mkdir -p /etc/nftables.d
+    if nft list table inet "$NFT_TABLE" > "$NFT_PERSIST_FILE" 2>/dev/null; then
+        if [ ! -f /etc/nftables.conf ]; then
+            {
+                echo '#!/usr/sbin/nft -f'
+                echo 'include "/etc/nftables.d/*.nft"'
+            } > /etc/nftables.conf
+        elif ! grep -q 'singboxlite\.nft\|/etc/nftables\.d/\*\.nft' /etc/nftables.conf 2>/dev/null; then
+            echo 'include "/etc/nftables.d/singboxlite.nft"' >> /etc/nftables.conf
+        fi
+        if command -v systemctl &>/dev/null; then
+            systemctl enable nftables >/dev/null 2>&1 || true
+        fi
+        if command -v rc-update &>/dev/null; then
+            rc-update add nftables default >/dev/null 2>&1 || true
+        fi
     fi
 }
 
@@ -130,10 +270,10 @@ _atomic_modify_json() {
 _atomic_modify_yaml() {
     local file="$1" filter="$2"
     [ ! -f "$file" ] && return 1
-    local tmp="${file}.tmp"
-    cp "$file" "$tmp"
+    local tmp="${file}.tmp.$$"
+    cp "$file" "$tmp" || return 1
     if ${YQ_BINARY} eval "$filter" -i "$file" 2>/dev/null; then
-        rm "$tmp"
+        rm -f "$tmp"
     else
         _error "修改 YAML 失败: $file"; mv "$tmp" "$file"; return 1
     fi
@@ -156,9 +296,10 @@ _manage_service() {
             local log_file="/var/log/sing-box.log"
             case "$action" in
                 start)
-                    if [ -s "$pid_file" ] && kill -0 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null; then
+                    if _is_pid_file_running_cmd "$pid_file" "$SINGBOX_BIN"; then
                         return 0
                     fi
+                    rm -f "$pid_file"
                     [ -s "$RELAY_CONFIG_FILE" ] || echo '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "$RELAY_CONFIG_FILE"
                     nohup env ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true \
                         ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM=true \
@@ -171,7 +312,9 @@ _manage_service() {
                     if [ -s "$pid_file" ]; then
                         local pid
                         pid=$(cat "$pid_file" 2>/dev/null)
-                        [ -n "$pid" ] && kill "$pid" 2>/dev/null
+                        if _is_pid_running_cmd "$pid" "$SINGBOX_BIN"; then
+                            kill "$pid" 2>/dev/null
+                        fi
                     fi
                     rm -f "$pid_file"
                     ;;
@@ -181,7 +324,7 @@ _manage_service() {
                     _manage_service start
                     ;;
                 status)
-                    [ -s "$pid_file" ] && kill -0 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null
+                    _is_pid_file_running_cmd "$pid_file" "$SINGBOX_BIN"
                     ;;
             esac
             ;;
@@ -214,20 +357,13 @@ _add_node_to_relay_yaml() {
         return
     fi
     
-    # 将 JSON 写入安全临时文件 (使用 mktemp 避免竞态条件)
-    local temp_json=$(mktemp /tmp/relay_node_XXXXXX.json)
-    echo "$proxy_json" > "$temp_json"
-    
     # 使用环境变量传递 JSON 字符串，确保安全性
-    export NODE_JSON="$(cat "$temp_json")"
-    ${YQ_BINARY} eval '.proxies += [env(NODE_JSON)]' -i "$RELAY_CLASH_YAML" 2>/dev/null
+    export NODE_JSON="$proxy_json"
+    _atomic_modify_yaml "$RELAY_CLASH_YAML" '.proxies += [env(NODE_JSON)]' || return 1
     
     # 使用环境变量避免名称中特殊字符问题
     export PROXY_NAME="$proxy_name"
-    ${YQ_BINARY} eval '.proxy-groups[] |= (select(.name == "中转节点") | .proxies += [env(PROXY_NAME)] | .proxies |= unique)' -i "$RELAY_CLASH_YAML" 2>/dev/null
-    
-    # 清理临时文件
-    rm -f "$temp_json"
+    _atomic_modify_yaml "$RELAY_CLASH_YAML" '.proxy-groups[] |= (select(.name == "中转节点") | .proxies += [env(PROXY_NAME)] | .proxies |= unique)' || return 1
     
     _info "已添加节点到 YAML 配置: ${proxy_name}"
 }
@@ -246,8 +382,8 @@ _remove_node_from_relay_yaml() {
     
     # 删除节点 - 使用环境变量避免特殊字符问题
     export PROXY_NAME="$proxy_name"
-    ${YQ_BINARY} eval 'del(.proxies[] | select(.name == env(PROXY_NAME)))' -i "$RELAY_CLASH_YAML" 2>/dev/null
-    ${YQ_BINARY} eval '.proxy-groups[] |= (select(.name == "中转节点") | .proxies |= del(.[] | select(. == env(PROXY_NAME))))' -i "$RELAY_CLASH_YAML" 2>/dev/null
+    _atomic_modify_yaml "$RELAY_CLASH_YAML" 'del(.proxies[] | select(.name == env(PROXY_NAME)))' || return 1
+    _atomic_modify_yaml "$RELAY_CLASH_YAML" '.proxy-groups[] |= (select(.name == "中转节点") | .proxies |= del(.[] | select(. == env(PROXY_NAME))))' || return 1
     
     _info "已从 YAML 配置中删除节点: ${proxy_name}"
 }
@@ -711,6 +847,17 @@ _finalize_relay_setup() {
         
         if _check_port_occupied "$listen_port"; then
             _error "端口 $listen_port 已被系统占用，请重新输入！"
+        elif [[ "$relay_type" == "hysteria2" || "$relay_type" == "tuic" ]]; then
+            hop_conflict=$(_pf_find_hy2_hop_conflict "$listen_port")
+            if [ -n "$hop_conflict" ]; then
+                local c_tag c_name c_range c_mode
+                IFS=$'\t' read -r c_tag c_name c_range c_mode <<< "$hop_conflict"
+                _error "UDP 入口端口 ${listen_port} 落在已有 HY2 端口跳跃范围 ${c_range} 内。"
+                _error "冲突节点: ${c_name} (${c_tag}, ${c_mode})。请换端口。"
+                continue
+            fi
+            _info "端口 $listen_port 可用。"
+            break
         else
             _info "端口 $listen_port 可用。"
             break
@@ -780,26 +927,41 @@ _finalize_relay_setup() {
             if [[ "$port_range" =~ ^([0-9]+)-([0-9]+)$ ]]; then
                 local hop_start="${BASH_REMATCH[1]}"
                 local hop_end="${BASH_REMATCH[2]}"
-                
-                local iptables_available="false"
-                if command -v iptables &>/dev/null; then
-                    # 探测宿主机是否扣留了 NAT 映射执行权限（部分劣质 LXC/Docker 典型症状）
-                    if iptables -t nat -L PREROUTING -n &>/dev/null; then
-                        iptables_available="true"
+                if [ "$hop_start" -lt 1 ] || [ "$hop_end" -gt 65535 ] || [ "$hop_start" -gt "$hop_end" ]; then
+                    _warn "跳跃端口范围无效，已取消该功能。"
+                    port_range=""
+                else
+                    local pf_conflict
+                    pf_conflict=$(_find_pf_udp_conflict_in_range "$hop_start" "$hop_end")
+                    if [ -n "$pf_conflict" ]; then
+                        local c_port c_name c_net c_target
+                        IFS=$'\t' read -r c_port c_name c_net c_target <<< "$pf_conflict"
+                        _warn "跳跃端口范围 ${port_range} 覆盖已有 ${c_net} 端口转发入口 ${c_port}（${c_name} -> ${c_target}），已取消该功能。"
+                        port_range=""
+                    fi
+                    if [ -n "$port_range" ]; then
+                        local hop_conflict
+                        hop_conflict=$(_find_udp_hop_conflict_in_range "$hop_start" "$hop_end" "$inbound_tag")
+                        if [ -n "$hop_conflict" ]; then
+                            local c_tag c_name c_range c_mode
+                            IFS=$'\t' read -r c_tag c_name c_range c_mode <<< "$hop_conflict"
+                            _warn "跳跃端口范围 ${port_range} 与已有跳跃范围 ${c_range} 重叠（${c_name}, ${c_tag}, ${c_mode}），已取消该功能。"
+                            port_range=""
+                        fi
                     fi
                 fi
                 
-                if [ "$iptables_available" == "true" ]; then
-                    iptables -t nat -A PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $listen_port
-                    if command -v ip6tables &>/dev/null && ip6tables -t nat -L PREROUTING -n &>/dev/null; then
-                        ip6tables -t nat -A PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $listen_port 2>/dev/null
+                if [ -n "$port_range" ]; then
+                    local nft_comment="singboxlite-relay-hop-${inbound_tag}"
+                    if _nft_apply_redirect_rule add "$hop_start" "$hop_end" "$listen_port" "$nft_comment"; then
+                        hop_str="&mport=${port_range}"
+                        _save_nftables_rules
+                        _info "已注入底层 nftables 高效端口映射: UDP ${port_range} -> ${listen_port}"
+                    else
+                        _warn "环境受限：原生容器 (LXC/Docker) 缺失必需的系统级 nftables NAT 操作权限。"
+                        _warn "高级中转为了节点本身的绝对稳定，不支持易崩溃的 JSON 多实例监听平替，现已安全截停并取消本次跳跃设定。"
+                        port_range=""
                     fi
-                    hop_str="&mport=${port_range}"
-                    _info "已注入底层 iptables 极速端口映射: UDP ${port_range} -> ${listen_port}"
-                else
-                    _warn "环境受限：原生容器 (LXC/Docker) 缺失必需的系统级 iptables NAT 操作权限。"
-                    _warn "高级中转为了节点本身的绝对稳定，不支持易崩溃的 JSON 多实例监听平替，现已安全截停并取消本次跳跃设定。"
-                    port_range=""
                 fi
             else
                 _warn "跳跃端口格式错误，已取消该功能。"
@@ -825,7 +987,7 @@ _finalize_relay_setup() {
         inbound_json=$(jq -n --arg t "$inbound_tag" --arg p "$listen_port" --arg pw "$password" --arg sn "$entrance_sni" --arg cert "$cert_path" --arg key "$key_path" \
             '{"type":"anytls","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"name":"default","password":$pw}],"padding_scheme":["stop=2","0=100-200","1=100-200"],"tls":{"enabled":true,"server_name":$sn,"certificate_path":$cert,"key_path":$key}}')
             
-        link="anytls://${password}@${link_ip}:${listen_port}?security=tls&sni=${entrance_sni}&insecure=1&allowInsecure=1&type=tcp#$(_url_encode "${node_name}")"
+        link="anytls://${password}@${link_ip}:${listen_port}?security=tls&sni=${entrance_sni}&insecure=1&type=tcp#$(_url_encode "${node_name}")"
     fi
     
     # 2. 写入配置到主配置文件
@@ -859,7 +1021,7 @@ _finalize_relay_setup() {
     
     _success "配置已更新！正在重启服务..."
     _manage_service restart
-    _save_iptables_rules
+    _save_nftables_rules
     
     # 3. 存储链接信息与扩展参数清理信息
     local LINKS_FILE="${RELAY_AUX_DIR}/relay_links.json"
@@ -1091,16 +1253,15 @@ _delete_relay() {
         if [[ "$confirm_all" == "yes" ]]; then
             _info "正在批量删除..."
             
-            # 清理历史可能存在的 iptables 跳跃端口规则
+            # 清理中转跳跃端口 nftables 规则
             if [ -f "${RELAY_AUX_DIR}/relay_links.json" ]; then
                 jq -r 'to_entries | .[] | select(.value.port_hopping) | "\(.key)|\(.value.port_hopping)"' "${RELAY_AUX_DIR}/relay_links.json" 2>/dev/null | while IFS="|" read -r ptag hop; do
                     local psuffix=$(echo "$ptag" | grep -oE "[0-9]+$")
                     local hstart="${hop%-*}"
                     local hend="${hop#*-}"
-                    if command -v iptables &>/dev/null; then iptables -t nat -D PREROUTING -p udp --dport ${hstart}:${hend} -j REDIRECT --to-ports $psuffix 2>/dev/null; fi
-                    if command -v ip6tables &>/dev/null; then ip6tables -t nat -D PREROUTING -p udp --dport ${hstart}:${hend} -j REDIRECT --to-ports $psuffix 2>/dev/null; fi
+                    _nft_apply_redirect_rule delete "$hstart" "$hend" "$psuffix" "singboxlite-relay-hop-${ptag}"
                 done
-                _save_iptables_rules 2>/dev/null
+                _save_nftables_rules 2>/dev/null
             fi
             
             # 简化逻辑：直接重置配置文件
@@ -1110,8 +1271,8 @@ _delete_relay() {
             
             # 清空 YAML
             if [ -f "$RELAY_CLASH_YAML" ] && [ -f "$YQ_BINARY" ]; then
-                ${YQ_BINARY} eval '.proxies = []' -i "$RELAY_CLASH_YAML"
-                ${YQ_BINARY} eval '.proxy-groups[0].proxies = []' -i "$RELAY_CLASH_YAML"
+                _atomic_modify_yaml "$RELAY_CLASH_YAML" '.proxies = []'
+                _atomic_modify_yaml "$RELAY_CLASH_YAML" '.proxy-groups[0].proxies = []'
             fi
              _manage_service restart
              _success "全部中转已清空"
@@ -1144,18 +1305,13 @@ _delete_relay() {
         
         [ -n "$node_name_yaml" ] && _remove_node_from_relay_yaml "$node_name_yaml"
         
-        # 将端口跳跃相关的 iptables 规则彻底卸载脱勾
+        # 将端口跳跃相关的 nftables 规则彻底卸载脱勾
         if [ -n "$port_hopping" ]; then
             local hop_start="${port_hopping%-*}"
             local hop_end="${port_hopping#*-}"
-            if command -v iptables &>/dev/null; then
-                iptables -t nat -D PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $port_suffix 2>/dev/null
-            fi
-            if command -v ip6tables &>/dev/null; then
-                ip6tables -t nat -D PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $port_suffix 2>/dev/null
-            fi
-            _save_iptables_rules 2>/dev/null
-            _info "已卸载绑定的 iptables UDP 端口跳跃范围转发规则 (${port_hopping})"
+            _nft_apply_redirect_rule delete "$hop_start" "$hop_end" "$port_suffix" "singboxlite-relay-hop-${in_tag}"
+            _save_nftables_rules 2>/dev/null
+            _info "已卸载绑定的 nftables UDP 端口跳跃范围转发规则 (${port_hopping})"
         fi
         
         _atomic_modify_json "$LINKS_FILE" "del(.\""$in_tag"\")"
@@ -1197,6 +1353,9 @@ _modify_relay_port() {
     local selected_rule=${rule_list[$((choice-1))]}
     local in_tag=$(echo "$selected_rule" | jq -r '.inbound')
     local old_port=$(jq -r --arg t "$in_tag" '.inbounds[] | select(.tag == $t) | .listen_port' "$CONFIG_FILE")
+    local LINKS_FILE="${RELAY_AUX_DIR}/relay_links.json"
+    local current_hop_info=""
+    [ -f "$LINKS_FILE" ] && current_hop_info=$(jq -r --arg t "$in_tag" '.[$t].port_hopping // empty' "$LINKS_FILE" 2>/dev/null)
     
     while true; do
         read -p "  请输入新的端口号: " new_port
@@ -1206,16 +1365,29 @@ _modify_relay_port() {
         
         if _check_port_occupied "$new_port"; then
              _error "端口 $new_port 已被系统占用，请重试！"
-        else
-             break
+             continue
         fi
+
+        if [ -n "$current_hop_info" ]; then
+            local hop_conflict
+            hop_conflict=$(_pf_find_hy2_hop_conflict "$new_port")
+            if [ -n "$hop_conflict" ]; then
+                local c_tag c_name c_range c_mode
+                IFS=$'\t' read -r c_tag c_name c_range c_mode <<< "$hop_conflict"
+                if [ "$c_tag" != "$in_tag" ]; then
+                    _error "新端口 ${new_port} 落在已有 HY2 端口跳跃范围 ${c_range} 内。"
+                    _error "冲突节点: ${c_name} (${c_tag}, ${c_mode})。请换端口。"
+                    continue
+                fi
+            fi
+        fi
+        break
     done
     
     _info "正在修改端口..."
     _atomic_modify_json "$CONFIG_FILE" "(.inbounds[] | select(.tag == \"$in_tag\") | .listen_port) = ($new_port|tonumber)"
     
     # [修复] 3. 同步更新 relay_links.json 中的链接端口与节点说明
-    local LINKS_FILE="${RELAY_AUX_DIR}/relay_links.json"
     local old_node_name=""
     local new_node_name=""
     if [ -f "$LINKS_FILE" ]; then
@@ -1250,31 +1422,28 @@ _modify_relay_port() {
         export NEW_RELAY_PORT="$new_port"
         
         # 1. 改名
-        ${YQ_BINARY} eval '(.proxies[] | select(.name == env(OLD_RELAY_NAME)) | .name) = env(NEW_RELAY_NAME)' -i "$RELAY_CLASH_YAML"
+        _atomic_modify_yaml "$RELAY_CLASH_YAML" '(.proxies[] | select(.name == env(OLD_RELAY_NAME)) | .name) = env(NEW_RELAY_NAME)'
         # 2. 改端口
-        ${YQ_BINARY} eval '(.proxies[] | select(.name == env(NEW_RELAY_NAME)) | .port) = (env(NEW_RELAY_PORT)|tonumber)' -i "$RELAY_CLASH_YAML"
+        _atomic_modify_yaml "$RELAY_CLASH_YAML" '(.proxies[] | select(.name == env(NEW_RELAY_NAME)) | .port) = (env(NEW_RELAY_PORT)|tonumber)'
         # 3. 更新所有分组中的引用
-        ${YQ_BINARY} eval '(.proxy-groups[].proxies[] | select(. == env(OLD_RELAY_NAME))) = env(NEW_RELAY_NAME)' -i "$RELAY_CLASH_YAML"
+        _atomic_modify_yaml "$RELAY_CLASH_YAML" '(.proxy-groups[].proxies[] | select(. == env(OLD_RELAY_NAME))) = env(NEW_RELAY_NAME)'
         
         _success "YAML 节点名同步完成: ${old_node_name} -> ${new_node_name}"
     fi
 
-    # 联动更新端口跳跃的 iptables 映射规则 (否则跳跃流量仍被转发到旧端口)
+    # 联动更新端口跳跃的 nftables 映射规则 (否则跳跃流量仍被转发到旧端口)
     local LINKS_FILE="${RELAY_AUX_DIR}/relay_links.json"
     if [ -f "$LINKS_FILE" ]; then
         local hop_info=$(jq -r --arg t "$in_tag" '.[$t].port_hopping // empty' "$LINKS_FILE" 2>/dev/null)
         if [ -n "$hop_info" ]; then
             local hop_start="${hop_info%-*}"
             local hop_end="${hop_info#*-}"
-            if command -v iptables &>/dev/null && iptables -t nat -L PREROUTING -n &>/dev/null; then
-                iptables -t nat -D PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $old_port 2>/dev/null
-                iptables -t nat -A PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $new_port
+            if _nft_apply_redirect_rule add "$hop_start" "$hop_end" "$new_port" "singboxlite-relay-hop-${in_tag}"; then
+                _save_nftables_rules
+                _info "已将端口跳跃映射从 ${old_port} 联动更新到 ${new_port}"
+            else
+                _warn "nftables 端口跳跃映射更新失败，请检查当前容器 netfilter 权限。"
             fi
-            if command -v ip6tables &>/dev/null && ip6tables -t nat -L PREROUTING -n &>/dev/null; then
-                ip6tables -t nat -D PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $old_port 2>/dev/null
-                ip6tables -t nat -A PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $new_port 2>/dev/null
-            fi
-            _info "已将端口跳跃映射从 ${old_port} 联动更新到 ${new_port}"
         fi
     fi
 
@@ -1282,7 +1451,7 @@ _modify_relay_port() {
     _log_operation "MODIFY_RELAY_PORT" "Tag: $in_tag, Old Port: $old_port, New Port: $new_port"
 
     _manage_service restart
-    _save_iptables_rules
+    _save_nftables_rules
     _success "服务已重启"
     read -p "  按回车键继续..."
 }
@@ -1291,7 +1460,7 @@ _modify_relay_port() {
 # ============================================================
 # --- 端口转发管理模块 (Port Forwarding) ---
 # 智能双引擎方案:
-#   引擎A (iptables DNAT): 内核级转发, TCP+UDP 全通, KVM/特权LXC 优先
+#   引擎A (nftables DNAT): 内核级转发, TCP+UDP 全通, KVM/特权LXC 优先
 #   引擎B (sing-box direct): 用户态转发, TCP+UDP 可用, 无特权环境降级
 # 元数据统一存储于 relay_pf.json
 # ============================================================
@@ -1320,10 +1489,16 @@ _pf_is_ipv6_literal() {
     [[ "$addr" == *:* ]]
 }
 
-_pf_format_to_destination() {
-    local family="$1"
-    local ip="$2"
-    local port="$3"
+_pf_nft_addr_key() {
+    if [ "$1" == "ipv6" ]; then
+        echo "ip6"
+    else
+        echo "ip"
+    fi
+}
+
+_pf_nft_dnat_target() {
+    local family="$1" ip="$2" port="$3"
     if [ "$family" == "ipv6" ]; then
         echo "[${ip}]:${port}"
     else
@@ -1331,24 +1506,72 @@ _pf_format_to_destination() {
     fi
 }
 
-_pf_can_write_iptables_rule() {
-    local bin="$1"
-    shift
-    command -v "$bin" &>/dev/null || return 1
-    "$bin" "$@" &>/dev/null || return 1
-    local delete_args=("$@")
-    local i
-    for ((i=0; i<${#delete_args[@]}; i++)); do
-        if [ "${delete_args[$i]}" == "-A" ]; then
-            delete_args[$i]="-D"
-            break
-        fi
+_pf_delete_nft_rule_set() {
+    local listen_port="$1"
+    local proto chain
+    for proto in tcp udp; do
+        for chain in prerouting output; do
+            _nft_delete_rules_by_comment "singboxlite-pf-${listen_port}-${proto}-${chain}"
+        done
+        _nft_delete_rules_by_comment "singboxlite-pf-${listen_port}-${proto}-fwd-in"
+        _nft_delete_rules_by_comment "singboxlite-pf-${listen_port}-${proto}-fwd-out"
     done
-    "$bin" "${delete_args[@]}" &>/dev/null
+    _nft_delete_rules_by_comment "singboxlite-pf-${listen_port}-masq"
 }
 
-_pf_has_ip6tables_nat() {
-    command -v ip6tables &>/dev/null && ip6tables -t nat -L PREROUTING -n &>/dev/null 2>&1
+_pf_find_hy2_hop_conflict() {
+    local listen_port="$1"
+    local conflict=""
+    if [ -f "$MAIN_METADATA_FILE" ]; then
+        conflict=$(jq -r --argjson port "$listen_port" '
+            to_entries[]
+            | select(.value.portHopping)
+            | (.value.portHopping | capture("^(?<start>[0-9]+)-(?<end>[0-9]+)$")?) as $range
+            | select($range != null)
+            | ($range.start | tonumber) as $start
+            | ($range.end | tonumber) as $end
+            | select($port >= $start and $port <= $end)
+            | [
+                .key,
+                (.value.name // .key),
+                .value.portHopping,
+                ("主HY2/" + (.value.portHoppingMode // "unknown"))
+              ]
+            | @tsv
+        ' "$MAIN_METADATA_FILE" 2>/dev/null | head -n 1)
+        [ -n "$conflict" ] && { echo "$conflict"; return 0; }
+    fi
+
+    local relay_links="${RELAY_AUX_DIR}/relay_links.json"
+    if [ -f "$relay_links" ]; then
+        conflict=$(jq -r --argjson port "$listen_port" '
+            to_entries[]
+            | select(.value.port_hopping)
+            | (.value.port_hopping | capture("^(?<start>[0-9]+)-(?<end>[0-9]+)$")?) as $range
+            | select($range != null)
+            | ($range.start | tonumber) as $start
+            | ($range.end | tonumber) as $end
+            | select($port >= $start and $port <= $end)
+            | [
+                .key,
+                (.value.node_name // .key),
+                .value.port_hopping,
+                "中转HY2/nftables"
+              ]
+            | @tsv
+        ' "$relay_links" 2>/dev/null | head -n 1)
+        [ -n "$conflict" ] && { echo "$conflict"; return 0; }
+    fi
+
+    return 1
+}
+
+_pf_can_write_nft_rules() {
+    local comment="singboxlite-pf-test-$$"
+    command -v nft &>/dev/null || return 1
+    _nft_ensure_base || return 1
+    nft add rule inet "$NFT_TABLE" prerouting tcp dport 65535 dnat ip to 127.0.0.1:65535 comment "$comment" >/dev/null 2>&1 || return 1
+    _nft_delete_rules_by_comment "$comment"
 }
 
 # 确保元数据文件存在
@@ -1362,7 +1585,7 @@ _pf_count() {
     jq 'length' "$PF_METADATA_FILE" 2>/dev/null || echo 0
 }
 
-# 启用内核 IP 转发 (iptables DNAT 的前提条件)
+# 启用内核 IP 转发 (nftables DNAT 的前提条件)
 _pf_enable_forwarding() {
     # IPv4 转发
     if [ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" != "1" ]; then
@@ -1403,8 +1626,8 @@ _pf_view() {
     while IFS=$'\t' read -r port name engine addr tport net_display; do
         [ -z "$port" ] && continue
         local engine_label=""
-        if [ "$engine" == "iptables" ]; then
-            engine_label="${GREEN}iptables${NC}"
+        if [ "$engine" == "nftables" ]; then
+            engine_label="${GREEN}nftables${NC}"
         else
             engine_label="${YELLOW}sing-box${NC}"
         fi
@@ -1478,38 +1701,29 @@ _pf_detect_engine() {
         fi
     fi
 
-    local can_nat_v4="false"
-    local can_filter_v4="false"
-    if _pf_can_write_iptables_rule iptables -t nat -A PREROUTING -p tcp --dport 65535 -j DNAT --to-destination 127.0.0.1:65535; then
-        can_nat_v4="true"
-    fi
-    if _pf_can_write_iptables_rule iptables -A FORWARD -p tcp --dport 65535 -j ACCEPT; then
-        can_filter_v4="true"
-    fi
-
-    if [ "$can_nat_v4" == "true" ] && [ "$can_filter_v4" == "true" ]; then
-        PF_ENGINE="iptables"
+    if _pf_can_write_nft_rules; then
+        PF_ENGINE="nftables"
     fi
 
     case "$PF_ENV_KIND" in
         host|kvm)
-            if [ "$PF_ENGINE" == "iptables" ]; then
-                PF_ACCESS_HINT="当前环境具备完整 netfilter 权限，将使用内核级 iptables 转发。"
+            if [ "$PF_ENGINE" == "nftables" ]; then
+                PF_ACCESS_HINT="当前环境具备完整 netfilter 权限，将使用内核级 nftables 转发。"
             else
                 PF_ACCESS_HINT="当前环境缺少完整 netfilter 权限，将回退到 sing-box 用户态转发。"
             fi
             ;;
         lxc)
-            if [ "$PF_ENGINE" == "iptables" ]; then
-                PF_ACCESS_HINT="当前 LXC 具备 NET_ADMIN/iptables 能力，将使用内核级 iptables 转发。"
+            if [ "$PF_ENGINE" == "nftables" ]; then
+                PF_ACCESS_HINT="当前 LXC 具备 NET_ADMIN/nftables 能力，将使用内核级 nftables 转发。"
             else
                 PF_ACCESS_HINT="当前 LXC 权限受限，将使用 sing-box 用户态转发；TCP/UDP 都可创建。"
             fi
             ;;
         docker|podman)
             PF_PUBLISH_HINT="true"
-            if [ "$PF_ENGINE" == "iptables" ]; then
-                PF_ACCESS_HINT="当前容器具备宿主级 netfilter 能力，将使用 iptables 转发。"
+            if [ "$PF_ENGINE" == "nftables" ]; then
+                PF_ACCESS_HINT="当前容器具备宿主级 netfilter 能力，将使用 nftables 转发。"
             else
                 PF_ACCESS_HINT="当前容器将使用 sing-box 用户态转发；若未使用 host 网络，请确保宿主机已预先发布对应的 TCP/UDP 端口。"
             fi
@@ -1551,7 +1765,7 @@ _pf_resolve_domain_family() {
     [ -n "$resolved" ] && echo "$resolved"
 }
 
-_pf_prepare_iptables_target() {
+_pf_prepare_nft_target() {
     local raw_addr="$1"
     local addr="$(_pf_normalize_target_addr "$raw_addr")"
 
@@ -1560,7 +1774,6 @@ _pf_prepare_iptables_target() {
         return 0
     fi
     if _pf_is_ipv6_literal "$addr"; then
-        _pf_has_ip6tables_nat || return 1
         printf 'ipv6\t%s\tfalse\n' "$addr"
         return 0
     fi
@@ -1570,7 +1783,7 @@ _pf_prepare_iptables_target() {
     resolved=$(_pf_resolve_domain_family "$addr" "ipv4")
     if [ -n "$resolved" ]; then
         family="ipv4"
-    elif _pf_has_ip6tables_nat; then
+    else
         resolved=$(_pf_resolve_domain_family "$addr" "ipv6")
         [ -n "$resolved" ] && family="ipv6"
     fi
@@ -1579,74 +1792,45 @@ _pf_prepare_iptables_target() {
     printf '%s\t%s\ttrue\n' "$family" "$resolved"
 }
 
-_pf_ensure_masquerade() {
-    local target_ip="$1"
-    local family="${2:-ipv4}"
-    local bin="iptables"
-
-    if [ "$family" == "ipv6" ]; then
-        bin="ip6tables"
-        _pf_has_ip6tables_nat || return 0
-    fi
-
-    "$bin" -t nat -A POSTROUTING -d "$target_ip" -j MASQUERADE 2>/dev/null
-}
-
-_pf_apply_forward_filter_rules() {
-    local op="$1"
-    local family="$2"
-    local proto="$3"
-    local target_ip="$4"
-    local target_port="$5"
-    local bin="iptables"
-
-    if [ "$family" == "ipv6" ]; then
-        bin="ip6tables"
-        command -v "$bin" &>/dev/null || return 0
-        "$bin" -L FORWARD -n &>/dev/null 2>&1 || return 0
-    else
-        command -v "$bin" &>/dev/null || return 0
-    fi
-
-    "$bin" "$op" FORWARD -p "$proto" -d "$target_ip" --dport "$target_port" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
-    "$bin" "$op" FORWARD -p "$proto" -s "$target_ip" --sport "$target_port" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
-}
-
-_pf_apply_iptables_rules() {
+_pf_apply_nft_rules() {
     local action="$1"
     local listen_port="$2"
     local target_ip="$3"
     local target_port="$4"
     local network="$5"
     local family="$6"
-    local bin="iptables"
     local rc=0
+    local addr_key
+    addr_key=$(_pf_nft_addr_key "$family")
 
-    if [ "$family" == "ipv6" ]; then
-        bin="ip6tables"
-        _pf_has_ip6tables_nat || return 1
+    if [ "$action" == "delete" ]; then
+        _pf_delete_nft_rule_set "$listen_port"
+        return 0
     fi
 
-    local chain_flag="-A"
-    [ "$action" == "delete" ] && chain_flag="-D"
+    _nft_ensure_base || return 1
+    _pf_delete_nft_rule_set "$listen_port"
+
     local to_dest
-    to_dest=$(_pf_format_to_destination "$family" "$target_ip" "$target_port")
+    to_dest=$(_pf_nft_dnat_target "$family" "$target_ip" "$target_port")
     local proto
     for proto in tcp udp; do
         if [[ "$network" != "$proto" && "$network" != "tcp+udp" ]]; then
             continue
         fi
-        if ! "$bin" -t nat "$chain_flag" PREROUTING -p "$proto" --dport "$listen_port" -j DNAT --to-destination "$to_dest" 2>/dev/null; then
-            [ "$action" == "add" ] && rc=1
+        if ! nft add rule inet "$NFT_TABLE" prerouting "$proto" dport "$listen_port" dnat "$addr_key" to "$to_dest" comment "singboxlite-pf-${listen_port}-${proto}-prerouting" >/dev/null 2>&1; then
+            rc=1
         fi
-        if ! "$bin" -t nat "$chain_flag" OUTPUT -p "$proto" --dport "$listen_port" -j DNAT --to-destination "$to_dest" 2>/dev/null; then
-            [ "$action" == "add" ] && rc=1
+        if ! nft add rule inet "$NFT_TABLE" output "$proto" dport "$listen_port" dnat "$addr_key" to "$to_dest" comment "singboxlite-pf-${listen_port}-${proto}-output" >/dev/null 2>&1; then
+            rc=1
         fi
-        _pf_apply_forward_filter_rules "$chain_flag" "$family" "$proto" "$target_ip" "$target_port"
+        nft add rule inet "$NFT_TABLE" forward "$proto" dport "$target_port" "$addr_key" daddr "$target_ip" ct state new,established,related accept comment "singboxlite-pf-${listen_port}-${proto}-fwd-in" >/dev/null 2>&1 || true
+        nft add rule inet "$NFT_TABLE" forward "$proto" sport "$target_port" "$addr_key" saddr "$target_ip" ct state established,related accept comment "singboxlite-pf-${listen_port}-${proto}-fwd-out" >/dev/null 2>&1 || true
     done
 
-    if [ "$action" == "add" ]; then
-        _pf_ensure_masquerade "$target_ip" "$family"
+    nft add rule inet "$NFT_TABLE" postrouting "$addr_key" daddr "$target_ip" masquerade comment "singboxlite-pf-${listen_port}-masq" >/dev/null 2>&1 || true
+    if [ "$rc" -ne 0 ]; then
+        _pf_delete_nft_rule_set "$listen_port"
     fi
     return "$rc"
 }
@@ -1785,8 +1969,8 @@ _pf_add() {
     _pf_detect_engine
     _pf_ensure_metadata
 
-    if [ "$PF_ENGINE" == "iptables" ]; then
-        _info "=== 添加端口转发规则 (引擎: iptables DNAT) ==="
+    if [ "$PF_ENGINE" == "nftables" ]; then
+        _info "=== 添加端口转发规则 (引擎: nftables DNAT) ==="
     else
         _warn "=== 添加端口转发规则 (引擎: sing-box 用户态转发) ==="
     fi
@@ -1827,8 +2011,8 @@ _pf_add() {
     local proto_choice
     local network="tcp"
     local network_display="TCP"
-    if [ "$PF_ENGINE" == "iptables" ]; then
-        echo -e "  ${CYAN}【信息】已启用内核级 iptables 转发${NC}"
+    if [ "$PF_ENGINE" == "nftables" ]; then
+        echo -e "  ${CYAN}【信息】已启用内核级 nftables 转发${NC}"
     else
         echo -e "  ${YELLOW}【提示】当前将使用 sing-box 用户态转发${NC}"
     fi
@@ -1844,6 +2028,18 @@ _pf_add() {
         *) ;;
     esac
 
+    if [[ "$network" == "udp" || "$network" == "tcp+udp" ]]; then
+        local hop_conflict
+        hop_conflict=$(_pf_find_hy2_hop_conflict "$listen_port")
+        if [ -n "$hop_conflict" ]; then
+            local c_tag c_name c_range c_mode
+            IFS=$'\t' read -r c_tag c_name c_range c_mode <<< "$hop_conflict"
+            _error "UDP 转发入口端口 ${listen_port} 落在已有 HY2 端口跳跃范围 ${c_range} 内。"
+            _error "冲突节点: ${c_name} (${c_tag}, ${c_mode})。请换端口或先调整该 HY2 跳跃范围。"
+            read -p "  按回车继续..."; return
+        fi
+    fi
+
     echo ""
     local custom_name
     read -p "  请输入备注名称 (直接回车默认: 转发规则-${listen_port}): " custom_name
@@ -1855,21 +2051,21 @@ _pf_add() {
     local target_family=""
     local resolved_ip=""
     local target_is_domain="false"
-    if [ "$PF_ENGINE" == "iptables" ]; then
+    if [ "$PF_ENGINE" == "nftables" ]; then
         local resolved_payload=""
-        resolved_payload=$(_pf_prepare_iptables_target "$target_addr")
+        resolved_payload=$(_pf_prepare_nft_target "$target_addr")
         if [ $? -ne 0 ] || [ -z "$resolved_payload" ]; then
-            _error "目标地址无法解析为可用的 IPv4/IPv6，无法创建 iptables 转发规则"
+            _error "目标地址无法解析为可用的 IPv4/IPv6，无法创建 nftables 转发规则"
             read -p "  按回车继续..."; return
         fi
         IFS=$'\t' read -r target_family resolved_ip target_is_domain <<< "$resolved_payload"
         [ "$target_is_domain" == "true" ] && _success "域名已解析: $target_addr -> $resolved_ip (${target_family})"
         _pf_enable_forwarding
-        if ! _pf_apply_iptables_rules "add" "$listen_port" "$resolved_ip" "$target_port" "$network" "$target_family"; then
-            _error "iptables 规则写入失败"
+        if ! _pf_apply_nft_rules "add" "$listen_port" "$resolved_ip" "$target_port" "$network" "$target_family"; then
+            _error "nftables 规则写入失败"
             read -p "  按回车继续..."; return
         fi
-        _save_iptables_rules
+        _save_nftables_rules
     else
         if ! _pf_apply_singbox_rules "add" "$listen_port" "$target_addr" "$target_port" "$network"; then
             _error "配置写入失败"
@@ -1931,9 +2127,9 @@ _pf_delete() {
     local del_dest="${sel_resolved:-$sel_addr}"
     [ -z "$sel_family" ] && sel_family=$(_pf_guess_target_family "$del_dest")
 
-    if [ "$sel_engine" == "iptables" ]; then
-        _pf_apply_iptables_rules "delete" "$selected_port" "$del_dest" "$sel_tport" "$sel_net" "$sel_family"
-        _save_iptables_rules
+    if [ "$sel_engine" == "nftables" ]; then
+        _pf_apply_nft_rules "delete" "$selected_port" "$del_dest" "$sel_tport" "$sel_net" "$sel_family"
+        _save_nftables_rules
     else
         _pf_apply_singbox_rules "delete" "$selected_port"
         _manage_service restart
@@ -2023,14 +2219,26 @@ _pf_modify() {
     local new_net_display=$(echo "$new_net" | tr '[:lower:]' '[:upper:]')
     [ "$new_net" == "tcp+udp" ] && new_net_display="TCP+UDP"
 
+    if [[ "$new_net" == "udp" || "$new_net" == "tcp+udp" ]]; then
+        local hop_conflict
+        hop_conflict=$(_pf_find_hy2_hop_conflict "$selected_port")
+        if [ -n "$hop_conflict" ]; then
+            local c_tag c_name c_range c_mode
+            IFS=$'\t' read -r c_tag c_name c_range c_mode <<< "$hop_conflict"
+            _error "UDP 转发入口端口 ${selected_port} 落在已有 HY2 端口跳跃范围 ${c_range} 内。"
+            _error "冲突节点: ${c_name} (${c_tag}, ${c_mode})。请换端口或先调整该 HY2 跳跃范围。"
+            read -p "  按回车继续..."; return
+        fi
+    fi
+
     local old_resolved=$(jq -r ".\"$selected_port\".resolved_ip // empty" "$PF_METADATA_FILE")
     local old_del_dest="${old_resolved:-$old_addr}"
     local old_family=$(jq -r ".\"$selected_port\".target_family // empty" "$PF_METADATA_FILE")
     [ -z "$old_family" ] && old_family=$(_pf_guess_target_family "$old_del_dest")
 
     local delete_ok="true"
-    if [ "$old_engine" == "iptables" ]; then
-        _pf_apply_iptables_rules "delete" "$selected_port" "$old_del_dest" "$old_tport" "$old_net" "$old_family"
+    if [ "$old_engine" == "nftables" ]; then
+        _pf_apply_nft_rules "delete" "$selected_port" "$old_del_dest" "$old_tport" "$old_net" "$old_family"
     else
         if ! _pf_apply_singbox_rules "delete" "$selected_port"; then
             delete_ok="false"
@@ -2046,14 +2254,14 @@ _pf_modify() {
     local resolved_ip=""
     local target_is_domain="false"
     local apply_ok="false"
-    if [ "$PF_ENGINE" == "iptables" ]; then
+    if [ "$PF_ENGINE" == "nftables" ]; then
         local resolved_payload=""
-        resolved_payload=$(_pf_prepare_iptables_target "$new_addr")
+        resolved_payload=$(_pf_prepare_nft_target "$new_addr")
         if [ $? -ne 0 ] || [ -z "$resolved_payload" ]; then
             _error "目标地址无法解析为可用的 IPv4/IPv6，正在恢复旧规则..."
-            if [ "$old_engine" == "iptables" ]; then
-                _pf_apply_iptables_rules "add" "$selected_port" "$old_del_dest" "$old_tport" "$old_net" "$old_family" >/dev/null 2>&1
-                _save_iptables_rules
+            if [ "$old_engine" == "nftables" ]; then
+                _pf_apply_nft_rules "add" "$selected_port" "$old_del_dest" "$old_tport" "$old_net" "$old_family" >/dev/null 2>&1
+                _save_nftables_rules
             else
                 _pf_apply_singbox_rules "add" "$selected_port" "$old_addr" "$old_tport" "$old_net" >/dev/null 2>&1 && _manage_service restart >/dev/null 2>&1
             fi
@@ -2062,9 +2270,9 @@ _pf_modify() {
         fi
         IFS=$'\t' read -r target_family resolved_ip target_is_domain <<< "$resolved_payload"
         [ "$target_is_domain" == "true" ] && _success "域名已解析: $new_addr -> $resolved_ip (${target_family})"
-        if _pf_apply_iptables_rules "add" "$selected_port" "$resolved_ip" "$new_tport" "$new_net" "$target_family"; then
+        if _pf_apply_nft_rules "add" "$selected_port" "$resolved_ip" "$new_tport" "$new_net" "$target_family"; then
             apply_ok="true"
-            _save_iptables_rules
+            _save_nftables_rules
         fi
     else
         if _pf_apply_singbox_rules "add" "$selected_port" "$new_addr" "$new_tport" "$new_net"; then
@@ -2078,9 +2286,9 @@ _pf_modify() {
 
     if [ "$apply_ok" != "true" ]; then
         _error "新规则创建失败，正在恢复旧规则..."
-        if [ "$old_engine" == "iptables" ]; then
-            _pf_apply_iptables_rules "add" "$selected_port" "$old_del_dest" "$old_tport" "$old_net" "$old_family" >/dev/null 2>&1
-            _save_iptables_rules
+        if [ "$old_engine" == "nftables" ]; then
+            _pf_apply_nft_rules "add" "$selected_port" "$old_del_dest" "$old_tport" "$old_net" "$old_family" >/dev/null 2>&1
+            _save_nftables_rules
         else
             _pf_apply_singbox_rules "add" "$selected_port" "$old_addr" "$old_tport" "$old_net" >/dev/null 2>&1 && _manage_service restart >/dev/null 2>&1
         fi
@@ -2117,8 +2325,8 @@ _pf_clear() {
             family=$(_pf_guess_target_family "$del_dest")
         fi
 
-        if [ "$engine" == "iptables" ]; then
-            _pf_apply_iptables_rules "delete" "$port" "$del_dest" "$tport" "$net" "$family"
+        if [ "$engine" == "nftables" ]; then
+            _pf_apply_nft_rules "delete" "$port" "$del_dest" "$tport" "$net" "$family"
         else
             _pf_apply_singbox_rules "delete" "$port"
             need_singbox_restart=true
@@ -2126,7 +2334,7 @@ _pf_clear() {
     done < <(jq -r 'to_entries[] | [.key, .value.engine, .value.target_addr, (.value.target_port|tostring), .value.network, (.value.resolved_ip // "null"), (.value.target_family // "null")] | @tsv' "$PF_METADATA_FILE" 2>/dev/null)
 
     echo '{}' > "$PF_METADATA_FILE"
-    _save_iptables_rules
+    _save_nftables_rules
     if [ "$need_singbox_restart" = true ]; then
         _manage_service restart
     fi
@@ -2153,25 +2361,18 @@ _pf_dns_refresh() {
         [ "$new_ip" == "$old_ip" ] && continue
 
         logger -t "pf-dns-refresh" "域名 $addr 的 IP 已变化: $old_ip -> $new_ip (端口 $port)"
-        _pf_apply_iptables_rules "delete" "$port" "$old_ip" "$tport" "$network" "$family"
-        _pf_apply_iptables_rules "add" "$port" "$new_ip" "$tport" "$network" "$family"
+        _pf_apply_nft_rules "delete" "$port" "$old_ip" "$tport" "$network" "$family"
+        _pf_apply_nft_rules "add" "$port" "$new_ip" "$tport" "$network" "$family"
 
         jq --arg p "$port" --arg ip "$new_ip" '.[$p].resolved_ip = $ip' "$PF_METADATA_FILE" > "${PF_METADATA_FILE}.tmp" \
             && mv "${PF_METADATA_FILE}.tmp" "$PF_METADATA_FILE"
 
         updated=true
-    done < <(jq -r 'to_entries[] | select(.value.engine == "iptables" and .value.target_is_domain == true and .value.resolved_ip != null) | [.key, .value.target_addr, .value.resolved_ip, (.value.target_port|tostring), .value.network, (.value.target_family // "ipv4")] | @tsv' "$PF_METADATA_FILE" 2>/dev/null)
+    done < <(jq -r 'to_entries[] | select(.value.engine == "nftables" and .value.target_is_domain == true and .value.resolved_ip != null) | [.key, .value.target_addr, .value.resolved_ip, (.value.target_port|tostring), .value.network, (.value.target_family // "ipv4")] | @tsv' "$PF_METADATA_FILE" 2>/dev/null)
 
     if [ "$updated" = true ]; then
-        if command -v iptables-save &>/dev/null; then
-            mkdir -p /etc/iptables
-            iptables-save > /etc/iptables/rules.v4 2>/dev/null
-        fi
-        if command -v ip6tables-save &>/dev/null; then
-            mkdir -p /etc/iptables
-            ip6tables-save > /etc/iptables/rules.v6 2>/dev/null
-        fi
-        logger -t "pf-dns-refresh" "iptables 规则已自动更新"
+        _save_nftables_rules
+        logger -t "pf-dns-refresh" "nftables 规则已自动更新"
     fi
 }
 
@@ -2179,7 +2380,7 @@ _pf_auto_manage_dns_cron() {
     [ ! -f "$PF_METADATA_FILE" ] && return 0
 
     local domain_count
-    domain_count=$(jq '[to_entries[] | select(.value.engine == "iptables" and .value.target_is_domain == true and .value.resolved_ip != null)] | length' "$PF_METADATA_FILE" 2>/dev/null || echo 0)
+    domain_count=$(jq '[to_entries[] | select(.value.engine == "nftables" and .value.target_is_domain == true and .value.resolved_ip != null)] | length' "$PF_METADATA_FILE" 2>/dev/null || echo 0)
     if [ "$domain_count" -gt 0 ]; then
         _pf_setup_dns_cron
     else
@@ -2203,8 +2404,8 @@ _pf_switch_engine() {
     while IFS=$'\t' read -r port name engine addr tport net_display; do
         [ -z "$port" ] && continue
         ports+=("$port")
-        if [ "$engine" == "iptables" ]; then
-            echo -e "  ${GREEN}[$i]${NC} 【${name}】:${CYAN}${port}${NC} -> ${CYAN}${addr}:${tport}${NC}  [${YELLOW}${net_display}${NC}]  引擎: ${GREEN}iptables${NC}"
+        if [ "$engine" == "nftables" ]; then
+            echo -e "  ${GREEN}[$i]${NC} 【${name}】:${CYAN}${port}${NC} -> ${CYAN}${addr}:${tport}${NC}  [${YELLOW}${net_display}${NC}]  引擎: ${GREEN}nftables${NC}"
         else
             echo -e "  ${GREEN}[$i]${NC} 【${name}】:${CYAN}${port}${NC} -> ${CYAN}${addr}:${tport}${NC}  [${YELLOW}${net_display}${NC}]  引擎: ${YELLOW}singbox${NC}"
         fi
@@ -2230,56 +2431,68 @@ _pf_switch_engine() {
     local cur_del_dest="${cur_resolved:-$cur_addr}"
 
     echo ""
-    if [ "$cur_engine" == "iptables" ]; then
-        echo -e "  当前引擎: ${GREEN}iptables${NC}  ->  切换目标: ${YELLOW}singbox${NC}"
+    if [ "$cur_engine" == "nftables" ]; then
+        echo -e "  当前引擎: ${GREEN}nftables${NC}  ->  切换目标: ${YELLOW}singbox${NC}"
         echo -e "  ${YELLOW}规则: 【${cur_name}】:${selected_port} -> ${cur_addr}:${cur_tport} [${cur_net_display}]${NC}"
         echo ""
-        read -p "  确认将此规则从 iptables 切换到 singbox 用户态转发？(y/N): " confirm
+        read -p "  确认将此规则从 nftables 切换到 singbox 用户态转发？(y/N): " confirm
         [ "$confirm" != "y" ] && return
 
-        # 删除旧 iptables 规则
+        # 删除旧 nftables 规则
         [ -z "$cur_family" ] && cur_family=$(_pf_guess_target_family "$cur_del_dest")
-        _pf_apply_iptables_rules "delete" "$selected_port" "$cur_del_dest" "$cur_tport" "$cur_net" "$cur_family"
-        _save_iptables_rules
+        _pf_apply_nft_rules "delete" "$selected_port" "$cur_del_dest" "$cur_tport" "$cur_net" "$cur_family"
+        _save_nftables_rules
 
         # 用原始域名/IP 建 singbox 规则（singbox 自己做 DNS 解析）
         if ! _pf_apply_singbox_rules "add" "$selected_port" "$cur_addr" "$cur_tport" "$cur_net"; then
-            _pf_apply_iptables_rules "add" "$selected_port" "$cur_del_dest" "$cur_tport" "$cur_net" "$cur_family" >/dev/null 2>&1
-            _save_iptables_rules
-            _error "切换失败，已恢复旧的 iptables 规则"
+            _pf_apply_nft_rules "add" "$selected_port" "$cur_del_dest" "$cur_tport" "$cur_net" "$cur_family" >/dev/null 2>&1
+            _save_nftables_rules
+            _error "切换失败，已恢复旧的 nftables 规则"
             read -p "  按回车继续..."; return
         fi
         if ! _manage_service restart; then
             _pf_apply_singbox_rules "delete" "$selected_port" >/dev/null 2>&1
-            _pf_apply_iptables_rules "add" "$selected_port" "$cur_del_dest" "$cur_tport" "$cur_net" "$cur_family" >/dev/null 2>&1
-            _save_iptables_rules
-            _error "切换失败，已恢复旧的 iptables 规则"
+            _pf_apply_nft_rules "add" "$selected_port" "$cur_del_dest" "$cur_tport" "$cur_net" "$cur_family" >/dev/null 2>&1
+            _save_nftables_rules
+            _error "切换失败，已恢复旧的 nftables 规则"
             read -p "  按回车继续..."; return
         fi
 
-        # 更新 metadata：引擎改为 singbox，清除 iptables 专用字段
+        # 更新 metadata：引擎改为 singbox，清除 nftables 专用字段
         jq --arg p "$selected_port" \
             '.[$p].engine = "singbox" | del(.[$p].resolved_ip) | del(.[$p].target_family) | del(.[$p].target_is_domain)' \
             "$PF_METADATA_FILE" > "${PF_METADATA_FILE}.tmp" \
             && mv "${PF_METADATA_FILE}.tmp" "$PF_METADATA_FILE"
 
         _success "已切换到 singbox 引擎，规则生效！"
-        echo -e "  ${YELLOW}注意: singbox 用户态转发 UDP 性能低于 iptables，但兼容性更好（如 QUIC/Hysteria2）${NC}"
+        echo -e "  ${YELLOW}注意: singbox 用户态转发 UDP 性能低于 nftables，但兼容性更好（如 QUIC/Hysteria2）${NC}"
 
     else
-        # singbox → iptables
-        echo -e "  当前引擎: ${YELLOW}singbox${NC}  ->  切换目标: ${GREEN}iptables${NC}"
+        # singbox -> nftables
+        echo -e "  当前引擎: ${YELLOW}singbox${NC}  ->  切换目标: ${GREEN}nftables${NC}"
         echo -e "  ${YELLOW}规则: 【${cur_name}】:${selected_port} -> ${cur_addr}:${cur_tport} [${cur_net_display}]${NC}"
         echo ""
 
-        # 先检测 iptables 是否可用
+        # 先检测 nftables 是否可用
         _pf_detect_engine
-        if [ "$PF_ENGINE" != "iptables" ]; then
-            _error "当前环境无法使用 iptables 引擎（缺少 netfilter 权限），无法切换"
+        if [ "$PF_ENGINE" != "nftables" ]; then
+            _error "当前环境无法使用 nftables 引擎（缺少 netfilter 权限），无法切换"
             read -p "  按回车继续..."; return
         fi
 
-        read -p "  确认将此规则从 singbox 切换到 iptables 内核转发？(y/N): " confirm
+        if [[ "$cur_net" == "udp" || "$cur_net" == "tcp+udp" ]]; then
+            local hop_conflict
+            hop_conflict=$(_pf_find_hy2_hop_conflict "$selected_port")
+            if [ -n "$hop_conflict" ]; then
+                local c_tag c_name c_range c_mode
+                IFS=$'\t' read -r c_tag c_name c_range c_mode <<< "$hop_conflict"
+                _error "UDP 转发入口端口 ${selected_port} 落在已有 HY2 端口跳跃范围 ${c_range} 内。"
+                _error "冲突节点: ${c_name} (${c_tag}, ${c_mode})。请换端口或先调整该 HY2 跳跃范围。"
+                read -p "  按回车继续..."; return
+            fi
+        fi
+
+        read -p "  确认将此规则从 singbox 切换到 nftables 内核转发？(y/N): " confirm
         [ "$confirm" != "y" ] && return
 
         # 删除旧 singbox 规则
@@ -2294,12 +2507,12 @@ _pf_switch_engine() {
             read -p "  按回车继续..."; return
         fi
 
-        # iptables 需要解析域名拿到 IP
+        # nftables 需要解析域名拿到 IP
         local new_family=""
         local new_resolved=""
         local new_is_domain="false"
         local resolved_payload=""
-        resolved_payload=$(_pf_prepare_iptables_target "$cur_addr")
+        resolved_payload=$(_pf_prepare_nft_target "$cur_addr")
         if [ $? -ne 0 ] || [ -z "$resolved_payload" ]; then
             _pf_apply_singbox_rules "add" "$selected_port" "$cur_addr" "$cur_tport" "$cur_net" >/dev/null 2>&1
             _manage_service restart >/dev/null 2>&1
@@ -2310,18 +2523,18 @@ _pf_switch_engine() {
         [ "$new_is_domain" == "true" ] && _success "域名已解析: $cur_addr -> $new_resolved (${new_family})"
 
         _pf_enable_forwarding
-        if ! _pf_apply_iptables_rules "add" "$selected_port" "$new_resolved" "$cur_tport" "$cur_net" "$new_family"; then
+        if ! _pf_apply_nft_rules "add" "$selected_port" "$new_resolved" "$cur_tport" "$cur_net" "$new_family"; then
             _pf_apply_singbox_rules "add" "$selected_port" "$cur_addr" "$cur_tport" "$cur_net" >/dev/null 2>&1
             _manage_service restart >/dev/null 2>&1
             _error "切换失败，已恢复旧的 singbox 规则"
             read -p "  按回车继续..."; return
         fi
-        _save_iptables_rules
+        _save_nftables_rules
 
-        # 更新 metadata：引擎改为 iptables，补充 iptables 专用字段
+        # 更新 metadata：引擎改为 nftables，补充 nftables 专用字段
         local updated_meta
         updated_meta=$(jq --arg p "$selected_port" --arg fam "$new_family" --arg ip "$new_resolved" \
-            '.[$p].engine = "iptables" | .[$p].target_family = $fam | .[$p].resolved_ip = $ip' \
+            '.[$p].engine = "nftables" | .[$p].target_family = $fam | .[$p].resolved_ip = $ip' \
             "$PF_METADATA_FILE")
         if [ "$new_is_domain" == "true" ]; then
             updated_meta=$(echo "$updated_meta" | jq --arg p "$selected_port" '.[$p].target_is_domain = true')
@@ -2329,7 +2542,7 @@ _pf_switch_engine() {
         echo "$updated_meta" > "${PF_METADATA_FILE}.tmp" \
             && mv "${PF_METADATA_FILE}.tmp" "$PF_METADATA_FILE"
 
-        _success "已切换到 iptables 引擎，规则生效！"
+        _success "已切换到 nftables 引擎，规则生效！"
     fi
 
     _pf_auto_manage_dns_cron
@@ -2390,7 +2603,7 @@ _menu() {
         echo -e "${CYAN}"
         echo "  ╔═══════════════════════════════════════╗"
         echo "  ║       singbox-lite 进阶转发管理       ║"
-        echo "  ║                (v15)                  ║"
+        echo "  ║                (v16)                  ║"
         echo "  ╚═══════════════════════════════════════╝"
         echo -e "${NC}"
 
@@ -2407,7 +2620,7 @@ _menu() {
         elif [ "$INIT_SYSTEM" == "openrc" ]; then
             rc-service "$service_name" status 2>/dev/null | grep -q "started" && service_status="${GREEN}● 运行中${NC}"
         else
-            [ -s /tmp/sing-box.pid ] && kill -0 "$(cat /tmp/sing-box.pid 2>/dev/null)" 2>/dev/null && service_status="${GREEN}● 运行中${NC}"
+            _is_pid_file_running_cmd /tmp/sing-box.pid "$SINGBOX_BIN" && service_status="${GREEN}● 运行中${NC}"
         fi
 
         echo -e "  系统版本: ${CYAN}${os_info}${NC}"
@@ -2445,7 +2658,7 @@ _menu() {
                    rm -f ${RELAY_AUX_DIR}/*.pem ${RELAY_AUX_DIR}/*.key 2>/dev/null
                    if [ -f "$RELAY_CLASH_YAML" ] && [ -f "$YQ_BINARY" ]; then
                        export PROXY_NAME_DUMMY="DUMMY"
-                       ${YQ_BINARY} eval '.proxies = [] | .proxy-groups[0].proxies = []' -i "$RELAY_CLASH_YAML" 2>/dev/null
+                       _atomic_modify_yaml "$RELAY_CLASH_YAML" '.proxies = [] | .proxy-groups[0].proxies = []'
                    fi
                    _manage_service restart
                    _success "全部中转已清空"

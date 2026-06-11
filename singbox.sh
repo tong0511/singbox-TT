@@ -1,8 +1,10 @@
 #!/bin/bash
 
 # 基础路径定义
-export SCRIPT_VERSION="15"
+export SCRIPT_VERSION="16"
 export DEFAULT_SNI="www.amd.com"
+export WS_EARLY_DATA_SIZE="2560"
+export WS_EARLY_DATA_HEADER="Sec-WebSocket-Protocol"
 SELF_SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_DIR="$(dirname "$SELF_SCRIPT_PATH")"
 SINGBOX_DIR="/usr/local/etc/sing-box"
@@ -48,6 +50,59 @@ _url_encode() {
     # [修复] 使用 jq 内建 @uri 过滤器，完美处理 UTF-8 多字节字符
     # jq 是必装依赖，@uri 以字节为单位执行标准 percent-encoding
     printf '%s' "$1" | jq -sRr @uri
+}
+
+_ws_path_with_early_data() {
+    local ws_path="${1:-/}"
+    if [[ "$ws_path" == *"ed="* ]]; then
+        printf '%s' "$ws_path"
+        return
+    fi
+    if [[ "$ws_path" == *"?"* ]]; then
+        printf '%s&ed=%s' "$ws_path" "$WS_EARLY_DATA_SIZE"
+    else
+        printf '%s?ed=%s' "$ws_path" "$WS_EARLY_DATA_SIZE"
+    fi
+}
+
+_cert_sha256_hex() {
+    local cert_path="$1"
+    [ -f "$cert_path" ] || return 1
+    openssl x509 -in "$cert_path" -noout -fingerprint -sha256 2>/dev/null | \
+        awk -F= 'NR==1 { gsub(":", "", $2); print tolower($2) }'
+}
+
+_tls_insecure_params() {
+    local skip_verify="$1"
+    local cert_path="$2"
+    local insecure_param=""
+    if [[ "$skip_verify" == "true" ]]; then
+        insecure_param="&insecure=1"
+        local cert_pcs=$(_cert_sha256_hex "$cert_path")
+        [ -n "$cert_pcs" ] && insecure_param="${insecure_param}&pcs=${cert_pcs}"
+    fi
+    printf '%s' "$insecure_param"
+}
+
+_append_pcs_to_tls_link() {
+    local url="$1"
+    local cert_path="$2"
+    [ -n "$url" ] || return 0
+    [[ "$url" == *"pcs="* ]] && { printf '%s' "$url"; return 0; }
+
+    local cert_pcs=$(_cert_sha256_hex "$cert_path")
+    [ -n "$cert_pcs" ] || { printf '%s' "$url"; return 0; }
+
+    local body="$url"
+    local fragment=""
+    if [[ "$url" == *"#"* ]]; then
+        body="${url%%#*}"
+        fragment="#${url#*#}"
+    fi
+
+    local sep="&"
+    [[ "$body" != *"?"* ]] && sep="?"
+    printf '%s%s%s%s' "$body" "$sep" "pcs=${cert_pcs}" "$fragment"
 }
 
 _ss_base64_encode() {
@@ -99,6 +154,27 @@ _check_port_occupied() {
     return 1
 }
 
+_is_pid_running_cmd() {
+    local pid="$1"
+    local pattern="$2"
+    [ -n "$pid" ] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    if [ -r "/proc/${pid}/cmdline" ]; then
+        tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null | grep -Fq "$pattern"
+    else
+        ps -p "$pid" -o args= 2>/dev/null | grep -Fq "$pattern"
+    fi
+}
+
+_is_pid_file_running_cmd() {
+    local pid_file="$1"
+    local pattern="$2"
+    local pid
+    [ -s "$pid_file" ] || return 1
+    pid=$(cat "$pid_file" 2>/dev/null)
+    _is_pid_running_cmd "$pid" "$pattern"
+}
+
 # 配置文件端口扫描 (预检是否已被本程序占用)
 _check_port_in_config() {
     local port=$1
@@ -119,29 +195,169 @@ _check_port_conflict() {
         [ "$silent" != "true" ] && _error "端口 ${port} 已被系统其他程序占用。"
         return 0
     fi
+    if [[ "$proto" == "udp" ]]; then
+        local hop_conflict
+        hop_conflict=$(_find_udp_hop_conflict_in_range "$port" "$port")
+        if [ -n "$hop_conflict" ]; then
+            local c_tag c_name c_range c_mode
+            IFS=$'\t' read -r c_tag c_name c_range c_mode <<< "$hop_conflict"
+            [ "$silent" != "true" ] && _error "UDP 端口 ${port} 落在已有 HY2 端口跳跃范围 ${c_range} 内（${c_name}, ${c_tag}, ${c_mode}）。"
+            return 0
+        fi
+    fi
     return 1
 }
 
-# IPTables 规则持久化 (跨 Debian/Alpine 双发行版兼容)
-_save_iptables_rules() {
-    if command -v netfilter-persistent &>/dev/null; then
-        # Debian/Ubuntu: 使用 netfilter-persistent 统一持久化 (含 v4+v6)
-        netfilter-persistent save >/dev/null 2>&1
+_find_pf_udp_conflict_in_range() {
+    local start="$1" end="$2"
+    local pf_meta="${SINGBOX_DIR}/relay_pf.json"
+    [ -f "$pf_meta" ] || return 1
+    jq -r --argjson start "$start" --argjson end "$end" '
+        to_entries[]
+        | (.key | tonumber?) as $port
+        | select($port != null and $port >= $start and $port <= $end)
+        | select(.value.network == "udp" or .value.network == "tcp+udp")
+        | [
+            .key,
+            (.value.name // "端口转发"),
+            (.value.network_display // .value.network // "UDP"),
+            ((.value.target_addr // "") + ":" + ((.value.target_port // "") | tostring))
+          ]
+        | @tsv
+    ' "$pf_meta" 2>/dev/null | head -n 1
+}
+
+_find_udp_hop_conflict_in_range() {
+    local start="$1" end="$2" exclude_tag="${3:-}"
+    local conflict=""
+    if [ -f "$METADATA_FILE" ]; then
+        conflict=$(jq -r --argjson start "$start" --argjson end "$end" --arg exclude "$exclude_tag" '
+            to_entries[]
+            | select(.key != $exclude)
+            | select(.value.portHopping)
+            | (.value.portHopping | capture("^(?<start>[0-9]+)-(?<end>[0-9]+)$")?) as $range
+            | select($range != null)
+            | ($range.start | tonumber) as $other_start
+            | ($range.end | tonumber) as $other_end
+            | select($start <= $other_end and $end >= $other_start)
+            | [
+                .key,
+                (.value.name // .key),
+                .value.portHopping,
+                ("主HY2/" + (.value.portHoppingMode // "unknown"))
+              ]
+            | @tsv
+        ' "$METADATA_FILE" 2>/dev/null | head -n 1)
+        [ -n "$conflict" ] && { echo "$conflict"; return 0; }
+    fi
+
+    local relay_links="${SINGBOX_DIR}/relay_links.json"
+    if [ -f "$relay_links" ]; then
+        conflict=$(jq -r --argjson start "$start" --argjson end "$end" --arg exclude "$exclude_tag" '
+            to_entries[]
+            | select(.key != $exclude)
+            | select(.value.port_hopping)
+            | (.value.port_hopping | capture("^(?<start>[0-9]+)-(?<end>[0-9]+)$")?) as $range
+            | select($range != null)
+            | ($range.start | tonumber) as $other_start
+            | ($range.end | tonumber) as $other_end
+            | select($start <= $other_end and $end >= $other_start)
+            | [
+                .key,
+                (.value.node_name // .key),
+                .value.port_hopping,
+                "中转HY2/nftables"
+              ]
+            | @tsv
+        ' "$relay_links" 2>/dev/null | head -n 1)
+        [ -n "$conflict" ] && { echo "$conflict"; return 0; }
+    fi
+
+    return 1
+}
+
+# nftables 规则管理 (独立表，避免污染系统其他防火墙规则)
+export NFT_TABLE="singboxlite"
+export NFT_PERSIST_FILE="/etc/nftables.d/singboxlite.nft"
+
+_nft_ensure_base() {
+    command -v nft &>/dev/null || return 1
+    nft list table inet "$NFT_TABLE" >/dev/null 2>&1 || nft add table inet "$NFT_TABLE" >/dev/null 2>&1 || return 1
+    nft list chain inet "$NFT_TABLE" prerouting >/dev/null 2>&1 || nft add chain inet "$NFT_TABLE" prerouting '{ type nat hook prerouting priority -100; policy accept; }' >/dev/null 2>&1 || return 1
+    nft list chain inet "$NFT_TABLE" output >/dev/null 2>&1 || nft add chain inet "$NFT_TABLE" output '{ type nat hook output priority -100; policy accept; }' >/dev/null 2>&1 || return 1
+    nft list chain inet "$NFT_TABLE" postrouting >/dev/null 2>&1 || nft add chain inet "$NFT_TABLE" postrouting '{ type nat hook postrouting priority 100; policy accept; }' >/dev/null 2>&1 || return 1
+    nft list chain inet "$NFT_TABLE" forward >/dev/null 2>&1 || nft add chain inet "$NFT_TABLE" forward '{ type filter hook forward priority 0; policy accept; }' >/dev/null 2>&1 || return 1
+}
+
+_nft_delete_rules_by_comment() {
+    local comment="$1"
+    local entries chain handle
+    command -v nft &>/dev/null || return 0
+    entries=$(nft -a list table inet "$NFT_TABLE" 2>/dev/null | awk -v c="comment \"$comment\"" '
+        /^[[:space:]]*chain / { chain=$2 }
+        index($0, c) && /# handle / { print chain, $NF }
+    ')
+    [ -z "$entries" ] && return 0
+    while read -r chain handle; do
+        [ -n "$chain" ] && [ -n "$handle" ] && nft delete rule inet "$NFT_TABLE" "$chain" handle "$handle" >/dev/null 2>&1
+    done <<< "$entries"
+}
+
+_nft_port_expr() {
+    local start="$1" end="$2"
+    if [ "$start" = "$end" ]; then
+        echo "$start"
     else
-        # Alpine / 通用方案: 分别保存 v4 和 v6 规则到标准路径
-        if command -v iptables-save &>/dev/null; then
-            mkdir -p /etc/iptables
-            iptables-save > /etc/iptables/rules.v4 2>/dev/null
+        echo "${start}-${end}"
+    fi
+}
+
+_nft_apply_redirect_rule() {
+    local action="$1" start_port="$2" end_port="$3" target_port="$4" comment="$5"
+    if [ "$action" = "delete" ]; then
+        _nft_delete_rules_by_comment "$comment"
+        return 0
+    fi
+    _nft_ensure_base || return 1
+    _nft_delete_rules_by_comment "$comment"
+    nft add rule inet "$NFT_TABLE" prerouting udp dport "$(_nft_port_expr "$start_port" "$end_port")" redirect to ":${target_port}" comment "$comment" >/dev/null 2>&1
+}
+
+_nft_can_redirect() {
+    local test_port="${1:-65530}" target_port="${2:-65531}" comment="singboxlite-test-redirect-$$"
+    _nft_apply_redirect_rule add "$test_port" "$test_port" "$target_port" "$comment" || return 1
+    _nft_apply_redirect_rule delete "$test_port" "$test_port" "$target_port" "$comment"
+    return 0
+}
+
+_save_nftables_rules() {
+    command -v nft &>/dev/null || return 0
+    mkdir -p /etc/nftables.d
+    if nft list table inet "$NFT_TABLE" > "$NFT_PERSIST_FILE" 2>/dev/null; then
+        if [ ! -f /etc/nftables.conf ]; then
+            {
+                echo '#!/usr/sbin/nft -f'
+                echo 'include "/etc/nftables.d/*.nft"'
+            } > /etc/nftables.conf
+        elif ! grep -q 'singboxlite\.nft\|/etc/nftables\.d/\*\.nft' /etc/nftables.conf 2>/dev/null; then
+            echo 'include "/etc/nftables.d/singboxlite.nft"' >> /etc/nftables.conf
         fi
-        if command -v ip6tables-save &>/dev/null; then
-            mkdir -p /etc/iptables
-            ip6tables-save > /etc/iptables/rules.v6 2>/dev/null
+        if command -v systemctl &>/dev/null; then
+            systemctl enable nftables >/dev/null 2>&1 || true
+        fi
+        if command -v rc-update &>/dev/null; then
+            rc-update add nftables default >/dev/null 2>&1 || true
         fi
     fi
-    # Alpine OpenRC: 尝试使用 rc-service 保存
-    if command -v rc-service &>/dev/null; then
-        rc-service iptables save 2>/dev/null
-        rc-service ip6tables save 2>/dev/null
+}
+
+_remove_nftables_rules() {
+    if command -v nft &>/dev/null; then
+        nft delete table inet "$NFT_TABLE" >/dev/null 2>&1 || true
+    fi
+    rm -f "$NFT_PERSIST_FILE"
+    if [ -f /etc/nftables.conf ]; then
+        sed -i '\|/etc/nftables.d/singboxlite.nft|d' /etc/nftables.conf 2>/dev/null || true
     fi
 }
 
@@ -182,10 +398,11 @@ _manage_service() {
         direct)
             case "$action" in
                 start)
-                    if [ -s "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; then
+                    if _is_pid_file_running_cmd "$PID_FILE" "$SINGBOX_BIN"; then
                         _success "sing-box 已在 direct 模式运行。"
                         return 0
                     fi
+                    rm -f "$PID_FILE"
                     [ -s "${SINGBOX_DIR}/relay.json" ] || echo '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "${SINGBOX_DIR}/relay.json"
                     nohup env GOMEMLIMIT="$(_get_mem_limit)MiB" \
                         ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true \
@@ -200,7 +417,9 @@ _manage_service() {
                     if [ -s "$PID_FILE" ]; then
                         local pid
                         pid=$(cat "$PID_FILE" 2>/dev/null)
-                        [ -n "$pid" ] && kill "$pid" 2>/dev/null
+                        if _is_pid_running_cmd "$pid" "$SINGBOX_BIN"; then
+                            kill "$pid" 2>/dev/null
+                        fi
                     fi
                     rm -f "$PID_FILE"
                     _success "sing-box direct 后台进程已停止。"
@@ -211,9 +430,10 @@ _manage_service() {
                     _manage_service start
                     ;;
                 status)
-                    if [ -s "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; then
+                    if _is_pid_file_running_cmd "$PID_FILE" "$SINGBOX_BIN"; then
                         _success "sing-box direct 后台模式运行中 (PID: $(cat "$PID_FILE"))"
                     else
+                        rm -f "$PID_FILE"
                         _warn "sing-box direct 后台模式未运行。"
                         return 1
                     fi
@@ -259,9 +479,15 @@ _atomic_modify_json() {
 _atomic_modify_yaml() {
     local file="$1" filter="$2"
     [ ! -f "$file" ] && return 1
-    cp "$file" "${file}.tmp"
-    if ${YQ_BINARY} eval "$filter" -i "$file"; then rm "${file}.tmp"
-    else _error "修改YAML失败: $file"; mv "${file}.tmp" "$file"; return 1; fi
+    local tmp="${file}.tmp.$$"
+    cp "$file" "$tmp" || return 1
+    if ${YQ_BINARY} eval "$filter" -i "$file" 2>/dev/null; then
+        rm -f "$tmp"
+    else
+        _error "修改YAML失败: $file"
+        mv "$tmp" "$file"
+        return 1
+    fi
 }
 
 # --- 资源与环境管理 ---
@@ -300,15 +526,15 @@ _get_proxy_field() {
 _add_node_to_yaml() {
     local proxy_json="$1"
     local proxy_name=$(echo "$proxy_json" | jq -r .name)
-    _atomic_modify_yaml "$CLASH_YAML_FILE" ".proxies |= . + [${proxy_json}] | .proxies |= unique_by(.name)"
+    _atomic_modify_yaml "$CLASH_YAML_FILE" ".proxies |= . + [${proxy_json}] | .proxies |= unique_by(.name)" || return 1
     export PROXY_NAME="$proxy_name"
-    ${YQ_BINARY} eval '.proxy-groups[] |= (select(.name == "节点选择") | .proxies |= . + [env(PROXY_NAME)] | .proxies |= unique)' -i "$CLASH_YAML_FILE"
+    _atomic_modify_yaml "$CLASH_YAML_FILE" '.proxy-groups[] |= (select(.name == "节点选择") | .proxies |= . + [env(PROXY_NAME)] | .proxies |= unique)'
 }
 _remove_node_from_yaml() {
     local proxy_name="$1"
     export PROXY_NAME="$proxy_name"
-    ${YQ_BINARY} eval 'del(.proxies[] | select(.name == env(PROXY_NAME)))' -i "$CLASH_YAML_FILE"
-    ${YQ_BINARY} eval '.proxy-groups[] |= (select(.name == "节点选择") | .proxies |= del(.[] | select(. == env(PROXY_NAME))))' -i "$CLASH_YAML_FILE"
+    _atomic_modify_yaml "$CLASH_YAML_FILE" 'del(.proxies[] | select(.name == env(PROXY_NAME)))' || return 1
+    _atomic_modify_yaml "$CLASH_YAML_FILE" '.proxy-groups[] |= (select(.name == "节点选择") | .proxies |= del(.[] | select(. == env(PROXY_NAME))))'
 }
 _find_proxy_name() {
     local port="$1" type="$2" tag="$3" proxy_name=""
@@ -391,7 +617,7 @@ export LOG_FILE="/var/log/sing-box.log"
 export PID_FILE="/tmp/sing-box.pid"
 export CLOUDFLARED_BIN="/usr/local/bin/cloudflared"
 export DEP_STATE_FILE="${SINGBOX_DIR}/dependencies.ok"
-export DEP_STATE_VERSION="20260524-2"
+export DEP_STATE_VERSION="20260529-nft-1"
 _detect_init_system
 case "$INIT_SYSTEM" in
     openrc) export SERVICE_FILE="/etc/init.d/sing-box" ;;
@@ -399,7 +625,7 @@ case "$INIT_SYSTEM" in
     *) export SERVICE_FILE="" ;;
 esac
 
-export -f _info _success _warn _warning _error _url_encode _url_decode _get_public_ip _detect_init_system _sync_system_time _release_install_cache _atomic_modify_json _atomic_modify_yaml _manage_service _pkg_install _get_proxy_field _add_node_to_yaml _remove_node_from_yaml _find_proxy_name
+export -f _info _success _warn _warning _error _url_encode _url_decode _ws_path_with_early_data _cert_sha256_hex _tls_insecure_params _get_public_ip _detect_init_system _sync_system_time _release_install_cache _atomic_modify_json _atomic_modify_yaml _manage_service _pkg_install _get_proxy_field _add_node_to_yaml _remove_node_from_yaml _find_proxy_name _nft_ensure_base _nft_delete_rules_by_comment _nft_port_expr _nft_apply_redirect_rule _nft_can_redirect _save_nftables_rules _remove_nftables_rules
 
 server_ip=""
 BATCH_MODE=false
@@ -408,13 +634,26 @@ trap 'rm -f ${SINGBOX_DIR}/*.tmp /tmp/singbox_links.tmp' EXIT
 _install_dependencies() {
     local force="${1:-false}"
     if [ "$force" != "true" ] && [ -s "$DEP_STATE_FILE" ] && grep -qx "$DEP_STATE_VERSION" "$DEP_STATE_FILE" 2>/dev/null; then
-        return 0
+        local missing_cached=""
+        for cmd in bash jq curl wget openssl tar unzip; do
+            if ! command -v "$cmd" &>/dev/null; then
+                missing_cached="$missing_cached $cmd"
+            fi
+        done
+        if ! command -v nft &>/dev/null; then
+            missing_cached="$missing_cached nftables"
+        fi
+        if [ -z "$missing_cached" ] && [ -x "$YQ_BINARY" ]; then
+            return 0
+        fi
+        [ ! -x "$YQ_BINARY" ] && missing_cached="$missing_cached yq"
+        _warn "依赖缓存存在，但关键工具缺失:${missing_cached}，将执行一次修复安装。"
     fi
 
     # 核心依赖：脚本运行的绝对前提，必须全部装上
     local core_pkgs="bash curl jq openssl wget tar unzip ca-certificates"
     # 可选依赖：部分功能需要，即使装失败也不致命
-    local optional_pkgs="procps iptables socat iproute2 cron lsof"
+    local optional_pkgs="procps nftables socat iproute2 cron lsof"
     
     # 针对不同发行版的 cron 包名适配
     if command -v apk &>/dev/null; then
@@ -428,7 +667,7 @@ _install_dependencies() {
     
     _info "正在安装可选依赖..."
     _pkg_install $optional_pkgs 2>/dev/null || {
-        # 可选依赖批量安装失败时（如 iptables 冲突），逐个尝试
+        # 可选依赖批量安装失败时逐个尝试
         _warn "部分可选依赖批量安装遇到冲突，正在逐个重试..."
         for pkg in $optional_pkgs; do
             _pkg_install "$pkg" 2>/dev/null || true
@@ -465,31 +704,22 @@ _install_dependencies() {
     printf '%s\n' "$DEP_STATE_VERSION" > "$DEP_STATE_FILE"
 }
 
-# 确保 iptables 可用，并检测实际 netfilter 写入能力
-_ensure_iptables() {
-    # 第一步：检测命令是否存在，不存在则尝试安装
-    if ! command -v iptables &>/dev/null; then
-        _info "未检测到 iptables，尝试安装..."
-        _pkg_install iptables
-        if ! command -v iptables &>/dev/null; then
-            _error "iptables 安装失败。"
+# 确保 nftables 可用，并检测实际 netfilter 写入能力
+_ensure_nftables() {
+    if ! command -v nft &>/dev/null; then
+        _info "未检测到 nftables，尝试安装..."
+        _pkg_install nftables
+        if ! command -v nft &>/dev/null; then
+            _error "nftables 安装失败。"
             return 1
         fi
-        _success "iptables 安装成功。"
+        _success "nftables 安装成功。"
     fi
 
-    # 第二步：探测实际 netfilter 能力（命令存在不等于有写权限）
-    # 用一条无害的临时规则测试 nat 表写权限，测试后立即删除
-    local test_ok="false"
-    if iptables -t nat -A PREROUTING -p tcp --dport 65530 -j DNAT --to-destination 127.0.0.1:65530 2>/dev/null; then
-        iptables -t nat -D PREROUTING -p tcp --dport 65530 -j DNAT --to-destination 127.0.0.1:65530 2>/dev/null
-        test_ok="true"
-    fi
-
-    if [ "$test_ok" != "true" ]; then
-        _warn "iptables 命令存在，但当前环境无 nat 表写权限（容器/LXC 无特权模式）。"
+    if ! _nft_can_redirect 65530 65531; then
+        _warn "nftables 命令存在，但当前环境无 netfilter 写权限（容器/LXC 无特权模式）。"
         _warn "端口转发将自动使用 sing-box 引擎代替。"
-        return 2  # 返回值 2 表示：命令存在但能力受限
+        return 2
     fi
 
     return 0
@@ -611,7 +841,7 @@ _start_argo_tunnel() {
     # 检查该端口对应的隧道是否已在运行
     if [ -f "$pid_file" ]; then
         local old_pid=$(cat "$pid_file" 2>/dev/null)
-        if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+        if _is_pid_running_cmd "$old_pid" "$CLOUDFLARED_BIN"; then
             _warning "检测到端口 $target_port 的 Argo 隧道已在运行 (PID: $old_pid)" >&2
             return 0
         fi
@@ -719,7 +949,7 @@ _stop_argo_tunnel() {
 
     if [ -f "$pid_file" ]; then
         local pid=$(cat "$pid_file")
-        if kill -0 "$pid" 2>/dev/null; then
+        if _is_pid_running_cmd "$pid" "$CLOUDFLARED_BIN"; then
             kill "$pid" 2>/dev/null
             _success "Argo 隧道 (端口: $target_port) 已停止"
         fi
@@ -729,6 +959,7 @@ _stop_argo_tunnel() {
 
 _stop_all_argo_tunnels() {
     _info "正在停止所有 Argo 隧道..."
+    local stopped_any=false
     for pid_file in /tmp/singbox_argo_*.pid; do
         [ -e "$pid_file" ] || continue
         # 解析端口
@@ -736,9 +967,11 @@ _stop_all_argo_tunnels() {
         local port=${filename#singbox_argo_}
         port=${port%.pid}
         _stop_argo_tunnel "$port"
+        stopped_any=true
     done
-    # 保底清理
-    pkill -f "cloudflared" 2>/dev/null
+    if [ "$stopped_any" = false ]; then
+        _warn "未找到本脚本记录的 Argo PID 文件，未执行全局 cloudflared 清理。"
+    fi
 }
 
 # ============================================================
@@ -866,6 +1099,8 @@ _add_argo_node() {
             --arg p "$port" \
             --arg u "$uuid" \
             --arg wsp "$ws_path" \
+            --argjson ed "$WS_EARLY_DATA_SIZE" \
+            --arg edh "$WS_EARLY_DATA_HEADER" \
             '{
                 "type": "vless",
                 "tag": $t,
@@ -874,7 +1109,9 @@ _add_argo_node() {
                 "users": [{"uuid": $u, "flow": ""}],
                 "transport": {
                     "type": "ws",
-                    "path": $wsp
+                    "path": $wsp,
+                    "max_early_data": $ed,
+                    "early_data_header_name": $edh
                 }
             }')
     elif [ "$protocol" == "trojan" ]; then
@@ -883,6 +1120,8 @@ _add_argo_node() {
             --arg p "$port" \
             --arg pw "$password" \
             --arg wsp "$ws_path" \
+            --argjson ed "$WS_EARLY_DATA_SIZE" \
+            --arg edh "$WS_EARLY_DATA_HEADER" \
             '{
                 "type": "trojan",
                 "tag": $t,
@@ -891,7 +1130,9 @@ _add_argo_node() {
                 "users": [{"password": $pw}],
                 "transport": {
                     "type": "ws",
-                    "path": $wsp
+                    "path": $wsp,
+                    "max_early_data": $ed,
+                    "early_data_header_name": $edh
                 }
             }')
     fi
@@ -954,6 +1195,8 @@ _add_argo_node() {
             --arg s "$tunnel_domain" \
             --arg u "$uuid" \
             --arg wsp "$ws_path" \
+            --argjson ed "$WS_EARLY_DATA_SIZE" \
+            --arg edh "$WS_EARLY_DATA_HEADER" \
             '{
                 "name": $n,
                 "type": "vless",
@@ -967,6 +1210,8 @@ _add_argo_node() {
                 "servername": $s,
                 "ws-opts": {
                     "path": $wsp,
+                    "max-early-data": $ed,
+                    "early-data-header-name": $edh,
                     "headers": {
                         "Host": $s
                     }
@@ -978,6 +1223,8 @@ _add_argo_node() {
             --arg s "$tunnel_domain" \
             --arg pw "$password" \
             --arg wsp "$ws_path" \
+            --argjson ed "$WS_EARLY_DATA_SIZE" \
+            --arg edh "$WS_EARLY_DATA_HEADER" \
             '{
                 "name": $n,
                 "type": "trojan",
@@ -990,6 +1237,8 @@ _add_argo_node() {
                 "sni": $s,
                 "ws-opts": {
                     "path": $wsp,
+                    "max-early-data": $ed,
+                    "early-data-header-name": $edh,
                     "headers": {
                         "Host": $s
                     }
@@ -1053,7 +1302,7 @@ _view_argo_nodes() {
         # [M4] 一次读取 PID 到变量，避免重复 cat
         local pid=""
         if [ -f "$pid_file" ]; then pid=$(cat "$pid_file" 2>/dev/null); fi
-        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        if _is_pid_running_cmd "$pid" "$CLOUDFLARED_BIN"; then
              state="${GREEN}运行中${NC} (PID: $pid)"
              # 如果是临时的，尝试从 log 读最新域名
              if [ "$argo_type" == "temp" ] || [ -z "$domain" ] || [ "$domain" == "null" ]; then
@@ -1070,12 +1319,13 @@ _view_argo_nodes() {
              # [新架构] 优先使用持久化链接
              link=$(jq -r --arg t "$tag" '.[$t].share_link // empty' "$ARGO_METADATA_FILE")
              
-             if [ -z "$link" ] || [ "$link" == "null" ]; then
-                 local safe_name=$(_url_encode "$name")
-                 local safe_path=$(_url_encode "$path")
-                 
-                 if [[ "$protocol" == "vless-ws" ]]; then
-                     link="vless://${uuid}@${domain}:443?encryption=none&security=tls&type=ws&host=${domain}&path=${safe_path}&sni=${domain}#${safe_name}"
+              if [ -z "$link" ] || [ "$link" == "null" ]; then
+                  local safe_name=$(_url_encode "$name")
+                  local ed_path=$(_ws_path_with_early_data "$path")
+                  local safe_path=$(_url_encode "$ed_path")
+                  
+                  if [[ "$protocol" == "vless-ws" ]]; then
+                      link="vless://${uuid}@${domain}:443?encryption=none&security=tls&type=ws&host=${domain}&path=${safe_path}&sni=${domain}#${safe_name}"
                  elif [[ "$protocol" == "trojan-ws" ]]; then
                      local safe_pw=$(_url_encode "$password")
                      link="trojan://${safe_pw}@${domain}:443?security=tls&type=ws&host=${domain}&path=${safe_path}&sni=${domain}#${safe_name}"
@@ -1346,7 +1596,7 @@ _argo_keepalive() {
         
         if [ -f "$pid_file" ]; then
             local pid=$(cat "$pid_file" 2>/dev/null)
-            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            if _is_pid_running_cmd "$pid" "$CLOUDFLARED_BIN"; then
                 is_running=true
             fi
         fi
@@ -1468,7 +1718,7 @@ _uninstall_argo() {
         systemctl disable cloudflared >/dev/null 2>&1
     fi
     
-    pkill -f "cloudflared" 2>/dev/null
+    _stop_all_argo_tunnels 2>/dev/null
     
     # 删除所有 PID/LOG 文件
     rm -f /tmp/singbox_argo_*.pid /tmp/singbox_argo_*.log
@@ -1518,7 +1768,58 @@ _view_argo_logs() {
     fi
 }
 
+_sync_argo_early_data() {
+    local config_updated=false
+    local links_updated=false
+    local yaml_updated=false
+
+    export WS_ED="$WS_EARLY_DATA_SIZE"
+    export WS_EDH="$WS_EARLY_DATA_HEADER"
+
+    if [ -s "$CONFIG_FILE" ] && jq -e 'any(.inbounds[]?; ((.tag // "" | startswith("argo-")) and ((.transport.type // "") == "ws") and (((.transport.max_early_data // 0) != (env.WS_ED | tonumber)) or ((.transport.early_data_header_name // "") != env.WS_EDH))))' "$CONFIG_FILE" >/dev/null 2>&1; then
+        _atomic_modify_json "$CONFIG_FILE" '(.inbounds[] | select((.tag // "" | startswith("argo-")) and ((.transport.type // "") == "ws")) | .transport.max_early_data) = (env.WS_ED | tonumber) | (.inbounds[] | select((.tag // "" | startswith("argo-")) and ((.transport.type // "") == "ws")) | .transport.early_data_header_name) = env.WS_EDH' || return 1
+        config_updated=true
+    fi
+
+    if [ -s "$ARGO_METADATA_FILE" ]; then
+        while IFS=$'\t' read -r tag protocol name domain uuid password path share_link; do
+            [ -z "$tag" ] && continue
+            [[ "$protocol" != "vless-ws" && "$protocol" != "trojan-ws" ]] && continue
+            [[ -z "$domain" || "$domain" == "null" ]] && continue
+
+            if [ -s "$CLASH_YAML_FILE" ] && [ -x "$YQ_BINARY" ] && [ -n "$name" ] && [ "$name" != "null" ]; then
+                export PROXY_NAME="$name"
+                local yaml_needs_update
+                yaml_needs_update=$(${YQ_BINARY} eval '.proxies[] | select(.name == env(PROXY_NAME) and .network == "ws" and (((.["ws-opts"]["max-early-data"] // "") | tostring) != strenv(WS_ED) or (.["ws-opts"]["early-data-header-name"] // "") != env(WS_EDH))) | .name' "$CLASH_YAML_FILE" 2>/dev/null | head -n 1)
+                if [ -n "$yaml_needs_update" ] && [ "$yaml_needs_update" != "null" ]; then
+                    _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(PROXY_NAME) and .network == "ws") | .["ws-opts"]["max-early-data"]) = (env(WS_ED) | tonumber) | (.proxies[] | select(.name == env(PROXY_NAME) and .network == "ws") | .["ws-opts"]["early-data-header-name"]) = env(WS_EDH)' >/dev/null 2>&1 && yaml_updated=true
+                fi
+            fi
+
+            if [[ "$share_link" == *"ed%3D${WS_EARLY_DATA_SIZE}"* || "$share_link" == *"ed=${WS_EARLY_DATA_SIZE}"* ]]; then
+                continue
+            fi
+
+            if [[ "$protocol" == "vless-ws" && -n "$uuid" && "$uuid" != "null" ]]; then
+                _show_node_link "vless-ws" "$name" "$domain" "443" "$tag" "$uuid" "$path" >/dev/null
+                links_updated=true
+            elif [[ "$protocol" == "trojan-ws" && -n "$password" && "$password" != "null" ]]; then
+                _show_node_link "trojan-ws" "$name" "$domain" "443" "$tag" "$password" "$path" >/dev/null
+                links_updated=true
+            fi
+        done < <(jq -r 'to_entries[] | [.key, (.value.protocol // "vless-ws"), (.value.name // ""), (.value.domain // ""), (.value.uuid // ""), (.value.password // ""), (.value.path // "/"), (.value.share_link // "")] | @tsv' "$ARGO_METADATA_FILE" 2>/dev/null)
+    fi
+
+    if [ "$config_updated" = true ]; then
+        _info "已为既有 Argo WS 节点补齐 Early Data 配置，正在重启 sing-box..."
+        _manage_service restart
+    elif [ "$links_updated" = true ] || [ "$yaml_updated" = true ]; then
+        _info "已同步既有 Argo WS 节点的 Early Data 客户端配置。"
+    fi
+}
+
 _argo_menu() {
+    _sync_argo_early_data
     while true; do
         clear
         echo -e "${CYAN}"
@@ -1688,53 +1989,23 @@ _uninstall() {
 
     # 2. 清理配置与日志
     _info "正在清理配置文件与日志..."
-    # 清理端口转发的 iptables 规则 (内联执行，避免 source 整个脚本导致 _menu 被调用)
+    # 清理脚本创建的 nftables 规则
     local pf_meta="${SINGBOX_DIR}/relay_pf.json"
     [ ! -f "$pf_meta" ] && pf_meta="${SINGBOX_DIR}/pf_metadata.json"
     if [ -f "$pf_meta" ] && command -v jq &>/dev/null; then
-        _info "正在清理端口转发规则 (iptables)..."
-        local _pf_ports
-        _pf_ports=$(jq -r 'keys[]' "$pf_meta" 2>/dev/null)
-        for _pf_p in $_pf_ports; do
-            local _pf_eng=$(jq -r --arg p "$_pf_p" '.[$p].engine // empty' "$pf_meta" 2>/dev/null)
-            local _pf_net=$(jq -r --arg p "$_pf_p" '.[$p].network // empty' "$pf_meta" 2>/dev/null)
-            local _pf_addr=$(jq -r --arg p "$_pf_p" '.[$p].target_addr // empty' "$pf_meta" 2>/dev/null)
-            local _pf_tport=$(jq -r --arg p "$_pf_p" '.[$p].target_port // empty' "$pf_meta" 2>/dev/null)
-            local _pf_resolved=$(jq -r --arg p "$_pf_p" '.[$p].resolved_ip // empty' "$pf_meta" 2>/dev/null)
-            local _pf_del_dest="${_pf_resolved:-$_pf_addr}"
-            
-            if [ "$_pf_eng" == "iptables" ] && [ -n "$_pf_del_dest" ]; then
-                if [[ "$_pf_net" == "tcp" || "$_pf_net" == "tcp+udp" ]]; then
-                    iptables -t nat -D PREROUTING -p tcp --dport "$_pf_p" -j DNAT --to-destination "${_pf_del_dest}:${_pf_tport}" 2>/dev/null
-                    iptables -t nat -D OUTPUT -p tcp --dport "$_pf_p" -j DNAT --to-destination "${_pf_del_dest}:${_pf_tport}" 2>/dev/null
-                fi
-                if [[ "$_pf_net" == "udp" || "$_pf_net" == "tcp+udp" ]]; then
-                    iptables -t nat -D PREROUTING -p udp --dport "$_pf_p" -j DNAT --to-destination "${_pf_del_dest}:${_pf_tport}" 2>/dev/null
-                    iptables -t nat -D OUTPUT -p udp --dport "$_pf_p" -j DNAT --to-destination "${_pf_del_dest}:${_pf_tport}" 2>/dev/null
-                fi
-                iptables -t nat -D POSTROUTING -d "$_pf_del_dest" -j MASQUERADE 2>/dev/null
-            fi
-        done
-        
         # 清理 DNS 动态刷新的 cron 任务
         if crontab -l 2>/dev/null | grep -qF "# pf-dns-auto-refresh"; then
             crontab -l 2>/dev/null | grep -vF "# pf-dns-auto-refresh" | crontab -
         fi
-        # 保存 iptables 规则
-        if command -v iptables-save &>/dev/null; then
-            iptables-save > /etc/iptables/rules.v4 2>/dev/null || iptables-save > /etc/iptables.rules 2>/dev/null
-        fi
-        if command -v ip6tables-save &>/dev/null; then
-            ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || ip6tables-save > /etc/ip6tables.rules 2>/dev/null
-        fi
     fi
+    _remove_nftables_rules
     rm -rf "${SINGBOX_DIR}" "${LOG_FILE}"
     
     # 3. 清理 Argo 隧道
     if [ -f "${CLOUDFLARED_BIN}" ]; then
         _info "正在清理 Argo 隧道..."
         _disable_argo_watchdog 2>/dev/null
-        pkill -f "cloudflared" 2>/dev/null
+        _stop_all_argo_tunnels 2>/dev/null
         rm -f "${CLOUDFLARED_BIN}"
         rm -rf "/etc/cloudflared"
     fi
@@ -2094,10 +2365,15 @@ _show_node_link() {
             ;;
         "vless-ws-tls")
             # 参数: uuid, sni, ws_path, skip_verify
-            local uuid="$1" sni="${2:-$DEFAULT_SNI}" ws_path="$3" skip_verify="$4"
-            local insecure_param=""
-            [[ "$skip_verify" == "true" ]] && insecure_param="&insecure=1&allowInsecure=1"
+            local uuid="$1" sni="${2:-$DEFAULT_SNI}" ws_path="$3" skip_verify="$4" cert_path="$5"
+            local insecure_param=$(_tls_insecure_params "$skip_verify" "$cert_path")
             url="vless://${uuid}@${link_ip}:${port}?security=tls&encryption=none&type=ws&host=${sni}&path=$(_url_encode "$ws_path")&sni=${sni}${insecure_param}#$(_url_encode "$name")"
+            ;;
+        "vless-grpc-tls")
+            # 参数: uuid, sni, service_name, skip_verify, cert_path
+            local uuid="$1" sni="${2:-$DEFAULT_SNI}" service_name="$3" skip_verify="$4" cert_path="$5"
+            local insecure_param=$(_tls_insecure_params "$skip_verify" "$cert_path")
+            url="vless://${uuid}@${link_ip}:${port}?security=tls&encryption=none&type=grpc&serviceName=$(_url_encode "$service_name")&authority=${sni}&sni=${sni}${insecure_param}#$(_url_encode "$name")"
             ;;
         "vless-tcp")
             # 参数: uuid
@@ -2106,9 +2382,8 @@ _show_node_link() {
             ;;
         "trojan-ws-tls")
             # 参数: password, sni, ws_path, skip_verify
-            local password="$1" sni="${2:-$DEFAULT_SNI}" ws_path="$3" skip_verify="$4"
-            local insecure_param=""
-            [[ "$skip_verify" == "true" ]] && insecure_param="&insecure=1&allowInsecure=1"
+            local password="$1" sni="${2:-$DEFAULT_SNI}" ws_path="$3" skip_verify="$4" cert_path="$5"
+            local insecure_param=$(_tls_insecure_params "$skip_verify" "$cert_path")
             url="trojan://${password}@${link_ip}:${port}?security=tls&type=ws&host=${sni}&path=$(_url_encode "$ws_path")&sni=${sni}${insecure_param}#$(_url_encode "$name")"
             ;;
         "hysteria2")
@@ -2116,7 +2391,11 @@ _show_node_link() {
             local password="$1" sni="${2:-$DEFAULT_SNI}" obfs_password="$3" port_hopping="$4"
             local obfs_param=""; [[ -n "$obfs_password" ]] && obfs_param="&obfs=salamander&obfs-password=$(_url_encode "${obfs_password}")"
             local hop_param=""; [[ -n "$port_hopping" ]] && hop_param="&mport=${port_hopping}&ports=${port_hopping}"
-            url="hysteria2://${password}@${link_ip}:${port}?sni=${sni}&insecure=1${obfs_param}${hop_param}#$(_url_encode "$name")"
+            local cert_path="${SINGBOX_DIR}/${tag}.pem"
+            local pin_param=""
+            local cert_pcs=$(_cert_sha256_hex "$cert_path")
+            [ -n "$cert_pcs" ] && pin_param="&pinSHA256=${cert_pcs}"
+            url="hysteria2://${password}@${link_ip}:${port}?sni=${sni}&insecure=1${obfs_param}${hop_param}${pin_param}#$(_url_encode "$name")"
             ;;
         "tuic")
             # 参数: uuid, password, sni
@@ -2125,11 +2404,8 @@ _show_node_link() {
             ;;
         "anytls")
             # 参数: password, sni, skip_verify
-            local password="$1" sni="${2:-$DEFAULT_SNI}" skip_verify="$3"
-            local insecure_param=""
-            if [ "$skip_verify" == "true" ]; then
-                insecure_param="&insecure=1&allowInsecure=1"
-            fi
+            local password="$1" sni="${2:-$DEFAULT_SNI}" skip_verify="$3" cert_path="$4"
+            local insecure_param=$(_tls_insecure_params "$skip_verify" "$cert_path")
             url="anytls://${password}@${link_ip}:${port}?security=tls&sni=${sni}${insecure_param}#$(_url_encode "$name")"
             ;;
         "any-reality")
@@ -2167,12 +2443,14 @@ _show_node_link() {
         "vless-ws")
             # Argo 专用: uuid, path
             local uuid="$1" ws_path="$2"
-            url="vless://${uuid}@${link_ip}:443?encryption=none&security=tls&type=ws&host=${link_ip}&path=$(_url_encode "$ws_path")&sni=${link_ip}#$(_url_encode "$name")"
+            local ed_path=$(_ws_path_with_early_data "$ws_path")
+            url="vless://${uuid}@${link_ip}:443?encryption=none&security=tls&type=ws&host=${link_ip}&path=$(_url_encode "$ed_path")&sni=${link_ip}#$(_url_encode "$name")"
             ;;
         "trojan-ws")
             # Argo 专用: password, path
             local password="$1" ws_path="$2"
-            url="trojan://$(_url_encode "${password}")@${link_ip}:443?security=tls&type=ws&host=${link_ip}&path=$(_url_encode "$ws_path")&sni=${link_ip}#$(_url_encode "$name")"
+            local ed_path=$(_ws_path_with_early_data "$ws_path")
+            url="trojan://$(_url_encode "${password}")@${link_ip}:443?security=tls&type=ws&host=${link_ip}&path=$(_url_encode "$ed_path")&sni=${link_ip}#$(_url_encode "$name")"
             ;;
         "socks")
             # 参数: username, password
@@ -2185,9 +2463,21 @@ _show_node_link() {
     
     if [ -n "$url" ]; then
         echo ""
-        echo -e "${YELLOW}═══════════════════ 分享链接 ═══════════════════${NC}"
-        echo -e "${CYAN}${url}${NC}"
-        echo -e "${YELLOW}═════════════════════════════════════════════════${NC}"
+        local clean_url=$(echo "$url" | sed 's/&insecure=1//g' | sed 's/&pcs=[a-fA-F0-9]*//g')
+        if [ "$clean_url" != "$url" ] && [[ "$url" != *"vless-reality"* ]] && [[ "$url" != *"any-reality"* ]]; then
+            echo -e "${YELLOW}═══════════════ 🔗 直连分享链接 (含防劫持指纹) ═══════════════${NC}"
+            echo -e "${CYAN}${url}${NC}"
+            echo -e "${YELLOW}══════════════════════════════════════════════════════════════${NC}"
+            echo ""
+            echo -e "${YELLOW}═════════════ 🔗 CF优选专用链接 (纯净版，无指纹冲突) ═════════════${NC}"
+            echo -e "${CYAN}${clean_url}${NC}"
+            echo -e "${YELLOW}══════════════════════════════════════════════════════════════${NC}"
+            echo -e "${CYAN}[提示] 如果您套用了 Cloudflare，请导入 ${YELLOW}CF优选专用链接${CYAN} 以避免握手失败！${NC}"
+        else
+            echo -e "${YELLOW}═══════════════════ 分享链接 ═══════════════════${NC}"
+            echo -e "${CYAN}${url}${NC}"
+            echo -e "${YELLOW}═════════════════════════════════════════════════${NC}"
+        fi
         
         # [持久化] 将生成的链接存入元数据，防止查看时由于动态提取导致的 SNI 丢失
         if [ -n "$tag" ] && [ "$tag" != "null" ]; then
@@ -2216,6 +2506,25 @@ _show_cdn_guidance() {
     fi
     _info "4. ${CYAN}【客户端】${NC}修改配置：地址改为优选域名/IP，端口改为 ${GREEN}443${NC}。"
     _info "   (注：Host/SNI 必须保持为您的域名 ${domain})"
+    echo -e "${YELLOW}══════════════════════════════════════════════════════════════════════${NC}"
+}
+
+_show_grpc_cdn_guidance() {
+    local domain="$1"
+    local port="$2"
+    echo ""
+    echo -e "${YELLOW}══════════════════ 🔧 VLESS gRPC + Cloudflare 配置提示 ══════════════════${NC}"
+    _info "1. ${CYAN}【CF 后台】${NC}将该域名的解析记录开启小黄云 (${ORANGE}Proxied${NC})。"
+    _info "2. ${CYAN}【CF 后台】${NC}在 [SSL/TLS] 菜单中，将加密模式设为: ${GREEN}Full (完全)${NC}。"
+    _info "3. ${CYAN}【CF 后台】${NC}在 [Network] 菜单中确认 gRPC 已开启。"
+    if [ "$port" != "443" ]; then
+        _warn "4. 您的服务器监听的是 ${port} 端口。请在 [Rules] -> [Origin Rules] 中配置："
+        _warn "   - 主机名 包含 \"${domain}\" -> 重写到端口: ${port}"
+    else
+        _info "4. 您的服务器已监听 443 端口，无需设置 Origin Rules。"
+    fi
+    _info "5. ${CYAN}【客户端】${NC}地址可改为优选域名/IP，端口改为 ${GREEN}443${NC}。"
+    _info "   (注：SNI 必须保持为您的域名 ${domain}，gRPC serviceName 必须保持一致)"
     echo -e "${YELLOW}══════════════════════════════════════════════════════════════════════${NC}"
 }
 
@@ -2399,7 +2708,173 @@ _add_vless_ws_tls() {
 
     # IPv6 处理用于链接
     local link_ip="$client_server_addr"
-    _show_node_link "vless-ws-tls" "$name" "$link_ip" "$client_port" "$tag" "$uuid" "$camouflage_domain" "$ws_path" "$skip_verify"
+    _show_node_link "vless-ws-tls" "$name" "$link_ip" "$client_port" "$tag" "$uuid" "$camouflage_domain" "$ws_path" "$skip_verify" "$cert_path"
+}
+
+_add_vless_grpc_tls() {
+    local camouflage_domain=""
+    local port=""
+    local client_server_addr="${server_ip}"
+
+    if [ "$BATCH_MODE" = "true" ]; then
+        [[ -n "$BATCH_IP" ]] && client_server_addr="$BATCH_IP"
+        port="$BATCH_PORT"
+        camouflage_domain="${BATCH_GRPC_TLS_DOMAIN:-$BATCH_SNI}"
+    else
+        _info "--- VLESS (gRPC+TLS) 设置向导 ---"
+        _info "请输入客户端用于“连接”的地址:"
+        _info "  - (推荐) 直接回车, 使用VPS的公网 IP: ${server_ip}"
+        _info "  - (其他) 您也可以手动输入一个IP或域名"
+        read -p "请输入连接地址 (默认: ${server_ip}): " connection_address
+        client_server_addr=${connection_address:-$server_ip}
+
+        # IPv6 处理
+        if [[ "$client_server_addr" == *":"* ]] && [[ "$client_server_addr" != "["* ]]; then
+             client_server_addr="[${client_server_addr}]"
+        fi
+
+        _info "请输入您的“伪装域名”，这个域名必须是您证书对应的域名。"
+        _info " (例如: xxx.741865.xyz)"
+        read -p "请输入伪装域名: " camouflage_domain
+        [[ -z "$camouflage_domain" ]] && _error "伪装域名不能为空" && return 1
+
+        while true; do
+            read -p "请输入监听端口 (直连模式下首推 443 端口): " port
+            [[ -z "$port" ]] && _error "端口不能为空" && continue
+            _check_port_conflict "$port" "tcp" && continue
+            break
+        done
+    fi
+
+    local client_port="$port"
+
+    local generated_service_name="grpc-$(${SINGBOX_BIN} generate rand --hex 4)"
+    local service_name=""
+    if [ "$BATCH_MODE" = "true" ]; then
+        service_name="${BATCH_GRPC_SERVICE_NAME:-$generated_service_name}"
+    else
+        read -p "请输入 gRPC serviceName (回车则随机生成: ${generated_service_name}): " input_service_name
+        service_name=${input_service_name:-$generated_service_name}
+        service_name=$(echo "$service_name" | xargs)
+        [[ -z "$service_name" ]] && _error "gRPC serviceName 不能为空" && return 1
+        _info "gRPC serviceName: ${service_name}"
+    fi
+
+    local tag="vless-grpc-in-${port}"
+    local cert_path=""
+    local key_path=""
+    local skip_verify=false
+
+    local cert_choice="1"
+    if [ "$BATCH_MODE" = "true" ]; then
+        cert_choice="1"
+    else
+        echo ""
+        echo "请选择证书类型:"
+        echo "  1) 自动生成自签名证书 (适合CF回源/直连跳过验证)"
+        echo "  2) 手动上传证书文件 (acme.sh签发/Cloudflare源证书等)"
+        read -p "请选择 [1-2] (默认: 1): " cert_choice
+        cert_choice=${cert_choice:-1}
+    fi
+
+    if [ "$cert_choice" == "1" ]; then
+        cert_path="${SINGBOX_DIR}/${tag}.pem"
+        key_path="${SINGBOX_DIR}/${tag}.key"
+        _generate_self_signed_cert "$camouflage_domain" "$cert_path" "$key_path" || return 1
+        skip_verify=true
+        _info "已生成自签名证书，客户端将跳过证书验证。"
+    else
+        _info "请输入 ${camouflage_domain} 对应的证书文件路径。"
+        _info "  - (推荐) 使用 acme.sh 签发的 fullchain.pem"
+        _info "  - (或)   使用 Cloudflare 源服务器证书"
+        read -p "请输入证书文件 .pem/.crt 的完整路径: " cert_path
+        [[ ! -f "$cert_path" ]] && _error "证书文件不存在: ${cert_path}" && return 1
+
+        read -p "请输入私钥文件 .key 的完整路径: " key_path
+        [[ ! -f "$key_path" ]] && _error "私钥文件不存在: ${key_path}" && return 1
+
+        read -p "$(echo -e ${YELLOW}"您是否正在使用 Cloudflare 源服务器证书 (或自签名证书)? (y/N): "${NC})" use_origin_cert
+        if [[ "$use_origin_cert" == "y" || "$use_origin_cert" == "Y" ]]; then
+            skip_verify=true
+            _warning "已启用 'skip-cert-verify: true'。这将跳过证书验证。"
+        fi
+    fi
+
+    local name=""
+    if [ "$BATCH_MODE" = "true" ]; then
+        name="Batch-VLESS-gRPC-${port}"
+    else
+        local default_name="VLESS-gRPC-${port}"
+        read -p "请输入节点名称 (默认: ${default_name}): " custom_name
+        name=${custom_name:-$default_name}
+    fi
+
+    local uuid=$(${SINGBOX_BIN} generate uuid)
+
+    local inbound_json=$(jq -n \
+        --arg t "$tag" \
+        --arg p "$port" \
+        --arg u "$uuid" \
+        --arg cp "$cert_path" \
+        --arg kp "$key_path" \
+        --arg sn "$camouflage_domain" \
+        --arg svc "$service_name" \
+        '{
+            "type": "vless",
+            "tag": $t,
+            "listen": "::",
+            "listen_port": ($p|tonumber),
+            "users": [{"uuid": $u, "flow": ""}],
+            "tls": {
+                "enabled": true,
+                "server_name": $sn,
+                "alpn": ["h2"],
+                "certificate_path": $cp,
+                "key_path": $kp
+            },
+            "transport": {
+                "type": "grpc",
+                "service_name": $svc
+            }
+        }')
+    _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json] | .inbounds |= unique_by(.tag)" || return 1
+
+    local proxy_json=$(jq -n \
+            --arg n "$name" \
+            --arg s "$client_server_addr" \
+            --arg p "$client_port" \
+            --arg u "$uuid" \
+            --arg sn "$camouflage_domain" \
+            --arg svc "$service_name" \
+            --arg skip_verify_bool "$skip_verify" \
+            '{
+                "name": $n,
+                "type": "vless",
+                "server": $s,
+                "port": ($p|tonumber),
+                "uuid": $u,
+                "encryption": "none",
+                "tls": true,
+                "udp": true,
+                "skip-cert-verify": ($skip_verify_bool == "true"),
+                "network": "grpc",
+                "servername": $sn,
+                "grpc-opts": {
+                    "grpc-service-name": $svc
+                }
+            }')
+
+    _add_node_to_yaml "$proxy_json"
+    _success "VLESS (gRPC+TLS) 节点 [${name}] 添加成功!"
+    _success "客户端连接地址 (server): ${client_server_addr}"
+    _success "客户端连接端口 (port): ${client_port}"
+    _success "客户端伪装域名 (sni): ${camouflage_domain}"
+    _success "gRPC serviceName: ${service_name}"
+
+    [ "$BATCH_MODE" != "true" ] && _show_grpc_cdn_guidance "${camouflage_domain}" "${port}"
+
+    local link_ip="$client_server_addr"
+    _show_node_link "vless-grpc-tls" "$name" "$link_ip" "$client_port" "$tag" "$uuid" "$camouflage_domain" "$service_name" "$skip_verify" "$cert_path"
 }
 
 _add_trojan_ws_tls() {
@@ -2590,7 +3065,7 @@ _add_trojan_ws_tls() {
 
     # IPv6 处理用于链接
     local link_ip="$client_server_addr"
-    _show_node_link "trojan-ws-tls" "$name" "$link_ip" "$client_port" "$tag" "$password" "$camouflage_domain" "$ws_path" "$skip_verify"
+    _show_node_link "trojan-ws-tls" "$name" "$link_ip" "$client_port" "$tag" "$password" "$camouflage_domain" "$ws_path" "$skip_verify" "$cert_path"
 }
 
 _create_anytls_tls_node() {
@@ -2713,7 +3188,7 @@ _create_anytls_tls_node() {
     # --- 生成分享链接 ---
     local insecure_param=""
     if [ "$skip_verify" == "true" ]; then
-        insecure_param="&insecure=1&allowInsecure=1"
+        insecure_param="&insecure=1"
     fi
     local share_link="anytls://${password}@${link_ip}:${port}?security=tls&sni=${server_name}${insecure_param}&type=tcp#$(_url_encode "$name")"
     
@@ -3015,6 +3490,27 @@ _add_hysteria2() {
         if [ -n "$port_hopping" ]; then
             local port_range_start=$(echo $port_hopping | cut -d'-' -f1)
             local port_range_end=$(echo $port_hopping | cut -d'-' -f2)
+            if [ "$port_range_start" -lt 1 ] || [ "$port_range_end" -gt 65535 ] || [ "$port_range_start" -gt "$port_range_end" ]; then
+                _error "批量创建错误: HY2 端口跳跃范围 ${port_hopping} 无效。"
+                return 1
+            fi
+            local pf_conflict
+            pf_conflict=$(_find_pf_udp_conflict_in_range "$port_range_start" "$port_range_end")
+            if [ -n "$pf_conflict" ]; then
+                local c_port c_name c_net c_target
+                IFS=$'\t' read -r c_port c_name c_net c_target <<< "$pf_conflict"
+                _error "批量创建错误: HY2 端口跳跃范围 ${port_hopping} 覆盖已有 ${c_net} 端口转发入口 ${c_port}（${c_name} -> ${c_target}）。"
+                return 1
+            fi
+            local hop_conflict
+            hop_conflict=$(_find_udp_hop_conflict_in_range "$port_range_start" "$port_range_end" "hy2-in-${port}")
+            if [ -n "$hop_conflict" ]; then
+                local c_tag c_name c_range c_mode
+                IFS=$'\t' read -r c_tag c_name c_range c_mode <<< "$hop_conflict"
+                _error "批量创建错误: HY2 端口跳跃范围 ${port_hopping} 与已有跳跃范围 ${c_range} 重叠。"
+                _error "冲突节点: ${c_name} (${c_tag}, ${c_mode})。"
+                return 1
+            fi
             use_multiport="true"
         fi
     else
@@ -3050,6 +3546,28 @@ _add_hysteria2() {
             if [[ "$port_range" =~ ^([0-9]+)-([0-9]+)$ ]]; then
                 port_range_start="${BASH_REMATCH[1]}"
                 port_range_end="${BASH_REMATCH[2]}"
+                if [ "$port_range_start" -lt 1 ] || [ "$port_range_end" -gt 65535 ] || [ "$port_range_start" -gt "$port_range_end" ]; then
+                    _error "端口跳跃范围无效。"
+                    return 1
+                fi
+                local pf_conflict
+                pf_conflict=$(_find_pf_udp_conflict_in_range "$port_range_start" "$port_range_end")
+                if [ -n "$pf_conflict" ]; then
+                    local c_port c_name c_net c_target
+                    IFS=$'\t' read -r c_port c_name c_net c_target <<< "$pf_conflict"
+                    _error "端口跳跃范围 ${port_range} 覆盖了已有 ${c_net} 端口转发入口 ${c_port}（${c_name} -> ${c_target}）。"
+                    _error "请调整跳跃范围或先删除/修改该端口转发规则。"
+                    return 1
+                fi
+                local hop_conflict
+                hop_conflict=$(_find_udp_hop_conflict_in_range "$port_range_start" "$port_range_end" "$tag")
+                if [ -n "$hop_conflict" ]; then
+                    local c_tag c_name c_range c_mode
+                    IFS=$'\t' read -r c_tag c_name c_range c_mode <<< "$hop_conflict"
+                    _error "端口跳跃范围 ${port_range} 与已有跳跃范围 ${c_range} 重叠。"
+                    _error "冲突节点: ${c_name} (${c_tag}, ${c_mode})。请调整跳跃范围。"
+                    return 1
+                fi
                 port_hopping="$port_range"
                 use_multiport="true"
             fi
@@ -3076,55 +3594,17 @@ _add_hysteria2() {
         '{"type":"hysteria2","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"password":$pw}],"tls":{"enabled":true,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}} | if $op != "" then .obfs={"type":"salamander","password":$op} else . end')
     _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json] | .inbounds |= unique_by(.tag)" || return 1
 
-    # [!] 重构多端口监听模式逻辑：优先使用 iptables，失败则降级到 JSON Inbound (带数量保护)
+    # [!] 多端口监听模式逻辑：优先使用 nftables，失败则降级到 JSON Inbound (带数量保护)
     local port_hopping_mode=""
     if [ "$use_multiport" == "true" ] && [ -n "$port_hopping" ]; then
-        local iptables_available="false"
-        local ip6tables_available="false"
-        local test_dport=$((port_range_start + 1))
-        [ "$test_dport" -eq "$port" ] && test_dport=$((port_range_start + 2))
-        if [ "$test_dport" -gt "$port_range_end" ]; then
-            test_dport="$port_range_start"
+        if _nft_apply_redirect_rule add "$port_range_start" "$port_range_end" "$port" "singboxlite-hy2-hop-${tag}"; then
+            _save_nftables_rules 2>/dev/null
+            port_hopping_mode="nftables"
+            _success "已启动底层 nftables 高效 UDP 端口跳跃范围映射: ${port_hopping} -> ${port}"
         fi
 
-        local force_native_hop="false"
-        if command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt --container 2>/dev/null | grep -qi '^lxc$'; then
-            force_native_hop="true"
-            _warn "检测到 LXC 容器环境，HY2 端口跳跃将直接使用 sing-box 原生多监听模式以避免 iptables REDIRECT 假生效。"
-        elif [ -f /proc/1/environ ] && tr '\0' '\n' < /proc/1/environ 2>/dev/null | grep -qi '^container=lxc$'; then
-            force_native_hop="true"
-            _warn "检测到 LXC 容器环境，HY2 端口跳跃将直接使用 sing-box 原生多监听模式以避免 iptables REDIRECT 假生效。"
-        fi
-
-        if [ "$force_native_hop" != "true" ]; then
-            if command -v iptables &>/dev/null; then
-                if iptables -t nat -A PREROUTING -p udp --dport "$test_dport" -j REDIRECT --to-ports "$port" 2>/dev/null; then
-                    iptables -t nat -D PREROUTING -p udp --dport "$test_dport" -j REDIRECT --to-ports "$port" 2>/dev/null
-                    iptables_available="true"
-                fi
-            fi
-            if command -v ip6tables &>/dev/null; then
-                if ip6tables -t nat -A PREROUTING -p udp --dport "$test_dport" -j REDIRECT --to-ports "$port" 2>/dev/null; then
-                    ip6tables -t nat -D PREROUTING -p udp --dport "$test_dport" -j REDIRECT --to-ports "$port" 2>/dev/null
-                    ip6tables_available="true"
-                fi
-            fi
-        fi
-
-        if [ "$iptables_available" == "true" ]; then
-            iptables -t nat -A PREROUTING -p udp --dport ${port_range_start}:${port_range_end} -j REDIRECT --to-ports $port || iptables_available="false"
-            if [ "$iptables_available" == "true" ]; then
-                if [ "$ip6tables_available" == "true" ]; then
-                    ip6tables -t nat -A PREROUTING -p udp --dport ${port_range_start}:${port_range_end} -j REDIRECT --to-ports $port 2>/dev/null || true
-                fi
-                _save_iptables_rules 2>/dev/null
-                port_hopping_mode="iptables"
-                _success "已启动底端 iptables 高能效 UDP 端口跳跃范围映射: ${port_hopping} -> ${port}"
-            fi
-        fi
-
-        if [ "$port_hopping_mode" != "iptables" ]; then
-            _warn "发现防火墙受限 (无 iptables REDIRECT 写权限)，准备降级至 Sing-box 原生多实例监听方案..."
+        if [ "$port_hopping_mode" != "nftables" ]; then
+            _warn "发现防火墙受限 (无 nftables redirect 写权限)，准备降级至 Sing-box 原生多实例监听方案..."
             local hop_count=$((port_range_end - port_range_start + 1))
             if [ "$hop_count" -le 1000 ]; then
                 _info "正在生成原生大量监听配置块 (${port_range_start}-${port_range_end})..."
@@ -3143,7 +3623,7 @@ _add_hysteria2() {
                 _success "安全降级成功：已硬编码 ${added_count} 个原生辅助监听节点 (跳过 ${skipped} 个冲突端口)。"
             else
                 _error "降级失败：目标跳跃端口数量 (${hop_count}) 超出低配原生环境的内存承载安全阈值 (1000)！"
-                _warn "鉴于当前系统容器不支持内核级 iptables 劫持，且端口数量超配，已自动取消该节点的跳跃设定。"
+                _warn "鉴于当前系统容器不支持内核级 nftables 重定向，且端口数量超配，已自动取消该节点的跳跃设定。"
                 port_hopping=""
                 port_hopping_mode=""
             fi
@@ -3547,11 +4027,11 @@ _view_nodes() {
         else
             case "$type" in
             "vless")
-                # [资源优化] 合并4次jq为1次
+                # [资源优化] 合并 VLESS 关键字段读取，避免循环内多次 jq
                 local _vless_fields
                 # [加固] 智能回溯 SNI: 优先 .tls.server_name, 备选 .tls.reality.handshake.server, 保底 www.amd.com
-                _vless_fields=$(echo "$node" | jq -r '[.users[0].uuid, (.users[0].flow // ""), (.tls.reality.enabled // false | tostring), (.transport.type // ""), (.tls.enabled // false | tostring), (.tls.server_name // .tls.reality.handshake.server // "www.amd.com"), (.transport.path // "")] | @tsv')
-                IFS=$'\t' read -r uuid flow is_reality transport_type tls_enabled tls_sn ws_path <<< "$_vless_fields"
+            _vless_fields=$(echo "$node" | jq -r '[.users[0].uuid, (.users[0].flow // ""), (.tls.reality.enabled // false | tostring), (.transport.type // ""), (.tls.enabled // false | tostring), (.tls.server_name // .tls.reality.handshake.server // "www.amd.com"), (.tls.certificate_path // ""), (.transport.path // ""), (.transport.service_name // "")] | @tsv')
+            IFS=$'\t' read -r uuid flow is_reality transport_type tls_enabled tls_sn cert_path ws_path grpc_service_name <<< "$_vless_fields"
                 
                 # [加固] 确保 Reality 模式下的流量控制字段非空 (v2rayN 要求)
                 [ "$is_reality" == "true" ] && [ -z "$flow" ] && flow="xtls-rprx-vision"
@@ -3575,8 +4055,26 @@ _view_nodes() {
                         argo_domain=$(jq -r --arg t "$tag" '.[$t].domain // empty' "$ARGO_METADATA_FILE" 2>/dev/null)
                     fi
                     if [ -n "$argo_domain" ] && [ "$argo_domain" != "null" ]; then
-                        url="vless://${uuid}@${argo_domain}:443?security=tls&encryption=none&type=ws&host=${argo_domain}&path=$(_url_encode "$ws_path")&sni=${argo_domain}#$(_url_encode "$display_name")"
+                        local argo_ws_path=$(_ws_path_with_early_data "$ws_path")
+                        url="vless://${uuid}@${argo_domain}:443?security=tls&encryption=none&type=ws&host=${argo_domain}&path=$(_url_encode "$argo_ws_path")&sni=${argo_domain}#$(_url_encode "$display_name")"
                     fi
+                elif [ "$transport_type" == "grpc" ]; then
+                    local sn="$tls_sn"
+                    [ -z "$sn" ] || [ "$sn" == "null" ] && sn=$(_get_proxy_field "$proxy_name_to_find" ".servername")
+                    [ -z "$sn" ] || [ "$sn" == "null" ] && sn="$DEFAULT_SNI"
+                    local svc="$grpc_service_name"
+                    if [ -z "$svc" ] || [ "$svc" == "null" ]; then
+                        svc=$(_get_proxy_field "$proxy_name_to_find" '.["grpc-opts"]["grpc-service-name"]')
+                    fi
+                    [ -z "$svc" ] || [ "$svc" == "null" ] && svc="grpc"
+                    local skip_verify=$(_get_proxy_field "$proxy_name_to_find" '.["skip-cert-verify"]')
+                    local insecure_param=""
+                    if [[ "$skip_verify" == "true" ]]; then
+                        insecure_param="&insecure=1"
+                        local cert_pcs=$(_cert_sha256_hex "$cert_path")
+                        [ -n "$cert_pcs" ] && insecure_param="${insecure_param}&pcs=${cert_pcs}"
+                    fi
+                    url="vless://${uuid}@${link_ip}:${port}?security=tls&encryption=none&type=grpc&serviceName=$(_url_encode "$svc")&sni=${sn}${insecure_param}#$(_url_encode "$display_name")"
                 elif [ "$tls_enabled" == "true" ]; then
                     local sn="$tls_sn"
                     url="vless://${uuid}@${link_ip}:${port}?security=tls&encryption=none&type=tcp&sni=${sn}#$(_url_encode "$display_name")"
@@ -3601,7 +4099,8 @@ _view_nodes() {
                         argo_domain=$(jq -r --arg t "$tag" '.[$t].domain // empty' "$ARGO_METADATA_FILE" 2>/dev/null)
                     fi
                     if [ -n "$argo_domain" ] && [ "$argo_domain" != "null" ]; then
-                        url="trojan://${password}@${argo_domain}:443?security=tls&type=ws&host=${argo_domain}&path=$(_url_encode "$ws_path")&sni=${argo_domain}#$(_url_encode "$display_name")"
+                        local argo_ws_path=$(_ws_path_with_early_data "$ws_path")
+                        url="trojan://${password}@${argo_domain}:443?security=tls&type=ws&host=${argo_domain}&path=$(_url_encode "$argo_ws_path")&sni=${argo_domain}#$(_url_encode "$display_name")"
                     fi
                 else
                     local sn=$(_get_proxy_field "$proxy_name_to_find" ".sni")
@@ -3635,7 +4134,7 @@ _view_nodes() {
                 local skip_verify=$(_get_proxy_field "$proxy_name_to_find" ".skip-cert-verify")
                 local insecure_param=""
                 if [ "$skip_verify" == "true" ]; then
-                    insecure_param="&insecure=1&allowInsecure=1"
+                    insecure_param="&insecure=1"
                 fi
                 url="anytls://${pw}@${link_ip}:${port}?security=tls&sni=${sn}${insecure_param}&type=tcp#$(_url_encode "$display_name")"
                 ;;
@@ -3729,7 +4228,7 @@ _delete_node() {
         
         _info "正在删除所有节点..."
         
-        # [安全性加固] 精准分离并销毁仅关联本脚本的 iptables 跳跃端口规则（必须在清空 metadata 之前执行！）
+        # [安全性加固] 精准分离并销毁仅关联本脚本的 nftables 跳跃端口规则（必须在清空 metadata 之前执行！）
         if [ -f "$METADATA_FILE" ]; then
             jq -r 'to_entries | .[] | select(.value.portHopping) | "\(.key)|\(.value.portHopping)|\(.value.portHoppingMode // \"\")"' "$METADATA_FILE" 2>/dev/null | while IFS="|" read -r ptag hop hop_mode; do
                 local psuffix=$(echo "$ptag" | grep -oE "[0-9]+$")
@@ -3739,15 +4238,14 @@ _delete_node() {
                     if jq -e --arg prefix "${ptag}-hop-" '.inbounds[] | select(.tag | startswith($prefix))' "$CONFIG_FILE" >/dev/null 2>&1; then
                         hop_mode="native"
                     else
-                        hop_mode="iptables"
+                        hop_mode="nftables"
                     fi
                 fi
-                if [ "$hop_mode" = "iptables" ]; then
-                    if command -v iptables &>/dev/null; then iptables -t nat -D PREROUTING -p udp --dport ${hstart}:${hend} -j REDIRECT --to-ports $psuffix 2>/dev/null; fi
-                    if command -v ip6tables &>/dev/null; then ip6tables -t nat -D PREROUTING -p udp --dport ${hstart}:${hend} -j REDIRECT --to-ports $psuffix 2>/dev/null; fi
+                if [ "$hop_mode" = "nftables" ]; then
+                    _nft_apply_redirect_rule delete "$hstart" "$hend" "$psuffix" "singboxlite-hy2-hop-${ptag}"
                 fi
             done
-            _save_iptables_rules 2>/dev/null
+            _save_nftables_rules 2>/dev/null
         fi
         
         # 清空配置
@@ -3755,8 +4253,8 @@ _delete_node() {
         _atomic_modify_json "$METADATA_FILE" '{}'
         
         # 清空 clash.yaml 中的代理
-        ${YQ_BINARY} eval '.proxies = []' -i "$CLASH_YAML_FILE"
-        ${YQ_BINARY} eval '.proxy-groups[] |= (select(.name == "节点选择") | .proxies = ["DIRECT"])' -i "$CLASH_YAML_FILE"
+        _atomic_modify_yaml "$CLASH_YAML_FILE" '.proxies = []'
+        _atomic_modify_yaml "$CLASH_YAML_FILE" '.proxy-groups[] |= (select(.name == "节点选择") | .proxies = ["DIRECT"])'
         
         # 删除所有证书文件
         rm -f ${SINGBOX_DIR}/*.pem ${SINGBOX_DIR}/*.key 2>/dev/null
@@ -3805,20 +4303,15 @@ _delete_node() {
             if jq -e --arg prefix "${tag_to_del}-hop-" '.inbounds[] | select(.tag | startswith($prefix))' "$CONFIG_FILE" >/dev/null 2>&1; then
                 port_hopping_mode="native"
             else
-                port_hopping_mode="iptables"
+                port_hopping_mode="nftables"
             fi
         fi
         local hop_start="${port_hopping%-*}"
         local hop_end="${port_hopping#*-}"
-        if [ "$port_hopping_mode" = "iptables" ]; then
-            if command -v iptables &>/dev/null; then
-                iptables -t nat -D PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $port_to_del 2>/dev/null
-            fi
-            if command -v ip6tables &>/dev/null; then
-                ip6tables -t nat -D PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $port_to_del 2>/dev/null
-            fi
-            _save_iptables_rules 2>/dev/null
-            _info "已卸载关联的底层 iptables UDP 端口映射策略 (${port_hopping})"
+        if [ "$port_hopping_mode" = "nftables" ]; then
+            _nft_apply_redirect_rule delete "$hop_start" "$hop_end" "$port_to_del" "singboxlite-hy2-hop-${tag_to_del}"
+            _save_nftables_rules 2>/dev/null
+            _info "已卸载关联的底层 nftables UDP 端口映射策略 (${port_hopping})"
         fi
     fi
     # [!] 级联清理：同时删除 JSON Fallback 模式可能生成的辅助跳跃子 inbounds (格式: tag-hop-xxx)
@@ -3958,7 +4451,7 @@ _modify_port() {
             if jq -e --arg prefix "${tag_to_modify}-hop-" '.inbounds[] | select(.tag | startswith($prefix))' "$CONFIG_FILE" >/dev/null 2>&1; then
                 hop_mode="native"
             else
-                hop_mode="iptables"
+                hop_mode="nftables"
             fi
         fi
     fi
@@ -3981,6 +4474,18 @@ _modify_port() {
         _error "端口 $new_port 已被其他节点使用！"
         return
     fi
+
+    if [[ "$type_to_modify" == "hysteria2" || "$type_to_modify" == "tuic" ]]; then
+        local new_port_hop_conflict
+        new_port_hop_conflict=$(_find_udp_hop_conflict_in_range "$new_port" "$new_port" "$tag_to_modify")
+        if [ -n "$new_port_hop_conflict" ]; then
+            local c_tag c_name c_range c_mode
+            IFS=$'\t' read -r c_tag c_name c_range c_mode <<< "$new_port_hop_conflict"
+            _error "新端口 ${new_port} 落在已有 HY2 端口跳跃范围 ${c_range} 内。"
+            _error "冲突节点: ${c_name} (${c_tag}, ${c_mode})。请换端口。"
+            return
+        fi
+    fi
     
     if [ -n "$hop_info" ]; then
         _info "检测到当前 HY2 节点启用了端口跳跃 (${hop_mode:-unknown}): ${hop_info}"
@@ -3998,6 +4503,24 @@ _modify_port() {
             final_hop_end="${hop_range_input#*-}"
             if [ "$final_hop_start" -lt 1 ] || [ "$final_hop_end" -gt 65535 ] || [ "$final_hop_start" -gt "$final_hop_end" ]; then
                 _error "端口跳跃范围无效。"
+                return
+            fi
+            local pf_conflict
+            pf_conflict=$(_find_pf_udp_conflict_in_range "$final_hop_start" "$final_hop_end")
+            if [ -n "$pf_conflict" ]; then
+                local c_port c_name c_net c_target
+                IFS=$'\t' read -r c_port c_name c_net c_target <<< "$pf_conflict"
+                _error "端口跳跃范围 ${hop_range_input} 覆盖了已有 ${c_net} 端口转发入口 ${c_port}（${c_name} -> ${c_target}）。"
+                _error "请调整跳跃范围或先删除/修改该端口转发规则。"
+                return
+            fi
+            local hop_conflict
+            hop_conflict=$(_find_udp_hop_conflict_in_range "$final_hop_start" "$final_hop_end" "$tag_to_modify")
+            if [ -n "$hop_conflict" ]; then
+                local c_tag c_name c_range c_mode
+                IFS=$'\t' read -r c_tag c_name c_range c_mode <<< "$hop_conflict"
+                _error "端口跳跃范围 ${hop_range_input} 与已有跳跃范围 ${c_range} 重叠。"
+                _error "冲突节点: ${c_name} (${c_tag}, ${c_mode})。请调整跳跃范围。"
                 return
             fi
             final_hop_info="$hop_range_input"
@@ -4127,56 +4650,28 @@ _modify_port() {
     # 5. 联动更新端口跳跃规则
     local final_tag="${new_tag:-$tag_to_modify}"
     if [ -n "$hop_info" ]; then
-        if [ "$hop_mode" = "iptables" ]; then
-            # [修复] 事务性 iptables 更新：先尝试写入新规则，成功后再删旧规则，失败则回滚
-            local ipt_v4_ok="false"
-            local ipt_v6_ok="false"
+        if [ "$hop_mode" = "nftables" ]; then
+            # [修复] 事务性 nftables 更新：先尝试写入新规则，成功后再持久化，失败则回滚
+            local nft_ok="false"
             local old_hop_start="${hop_info%-*}"
             local old_hop_end="${hop_info#*-}"
 
             if [ -n "$final_hop_info" ]; then
-                # === 有新跳跃范围：先写新规则，成功后再删旧规则 ===
-                # Step 1: 尝试写入新 v4 规则
-                if command -v iptables &>/dev/null; then
-                    if iptables -t nat -A PREROUTING -p udp --dport ${final_hop_start}:${final_hop_end} -j REDIRECT --to-ports $new_port 2>/dev/null; then
-                        ipt_v4_ok="true"
-                    else
-                        _error "iptables 新跳跃规则写入失败 (v4)，端口跳跃映射未更新。"
-                        _warn "尝试保留旧映射规则 (${old_hop_start}-${old_hop_end} -> ${old_port})..."
-                        # 不删旧规则，直接中止（config.json 端口已改，但 iptables 保持旧映射兜底）
-                    fi
+                if [ "$final_tag" != "$tag_to_modify" ]; then
+                    _nft_apply_redirect_rule delete "$old_hop_start" "$old_hop_end" "$old_port" "singboxlite-hy2-hop-${tag_to_modify}"
                 fi
-                # Step 2: 尝试写入新 v6 规则（可选，失败不阻断 v4 流程）
-                if command -v ip6tables &>/dev/null; then
-                    if ip6tables -t nat -A PREROUTING -p udp --dport ${final_hop_start}:${final_hop_end} -j REDIRECT --to-ports $new_port 2>/dev/null; then
-                        ipt_v6_ok="true"
-                    fi
-                fi
-                # Step 3: 只有 v4 成功才删旧规则并持久化
-                if [ "$ipt_v4_ok" = "true" ]; then
-                    if command -v iptables &>/dev/null; then
-                        iptables -t nat -D PREROUTING -p udp --dport ${old_hop_start}:${old_hop_end} -j REDIRECT --to-ports $old_port 2>/dev/null
-                    fi
-                    if [ "$ipt_v6_ok" = "true" ] && command -v ip6tables &>/dev/null; then
-                        ip6tables -t nat -D PREROUTING -p udp --dport ${old_hop_start}:${old_hop_end} -j REDIRECT --to-ports $old_port 2>/dev/null
-                    fi
-                    _save_iptables_rules 2>/dev/null
+                if _nft_apply_redirect_rule add "$final_hop_start" "$final_hop_end" "$new_port" "singboxlite-hy2-hop-${final_tag}"; then
+                    nft_ok="true"
+                    _save_nftables_rules 2>/dev/null
                     _info "已将端口跳跃映射从 ${old_port} 联动更新到 ${new_port}，范围: ${final_hop_info}"
                 else
-                    # v4 写入失败：回滚刚才可能残留的新规则（防止重复规则），并报错
-                    iptables -t nat -D PREROUTING -p udp --dport ${final_hop_start}:${final_hop_end} -j REDIRECT --to-ports $new_port 2>/dev/null
-                    ip6tables -t nat -D PREROUTING -p udp --dport ${final_hop_start}:${final_hop_end} -j REDIRECT --to-ports $new_port 2>/dev/null
-                    _error "端口跳跃 iptables 规则更新失败，旧映射保持不变。端口修改仍会继续，但 HY2 跳跃可能失效，请手动检查 iptables nat 规则！"
+                    _nft_apply_redirect_rule delete "$final_hop_start" "$final_hop_end" "$new_port" "singboxlite-hy2-hop-${final_tag}"
+                    _error "端口跳跃 nftables 规则更新失败，旧映射保持不变。端口修改仍会继续，但 HY2 跳跃可能失效，请手动检查 nftables 规则！"
                 fi
             else
                 # === 无新跳跃范围：仅删除旧规则 ===
-                if command -v iptables &>/dev/null; then
-                    iptables -t nat -D PREROUTING -p udp --dport ${old_hop_start}:${old_hop_end} -j REDIRECT --to-ports $old_port 2>/dev/null
-                fi
-                if command -v ip6tables &>/dev/null; then
-                    ip6tables -t nat -D PREROUTING -p udp --dport ${old_hop_start}:${old_hop_end} -j REDIRECT --to-ports $old_port 2>/dev/null
-                fi
-                _save_iptables_rules 2>/dev/null
+                _nft_apply_redirect_rule delete "$old_hop_start" "$old_hop_end" "$old_port" "singboxlite-hy2-hop-${tag_to_modify}"
+                _save_nftables_rules 2>/dev/null
                 _info "已移除端口跳跃映射。"
             fi
         elif [ "$hop_mode" = "native" ]; then
@@ -4428,7 +4923,11 @@ _do_update_xray() {
             _success "Xray 服务已重启。"
         elif [ "$INIT_SYSTEM" == "direct" ]; then
             if [ -s /tmp/xray.pid ]; then
-                kill "$(cat /tmp/xray.pid 2>/dev/null)" 2>/dev/null
+                local xray_pid
+                xray_pid=$(cat /tmp/xray.pid 2>/dev/null)
+                if _is_pid_running_cmd "$xray_pid" "$xray_bin"; then
+                    kill "$xray_pid" 2>/dev/null
+                fi
             fi
             nohup "$xray_bin" run -c "${xray_dir}/config.json" >> /var/log/xray.log 2>&1 &
             echo $! > /tmp/xray.pid
@@ -4597,7 +5096,7 @@ _main_menu() {
                     service_status="${RED}○ 已停止${NC}"
                 fi
             elif [ "$INIT_SYSTEM" == "direct" ]; then
-                if [ -s "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; then
+                if _is_pid_file_running_cmd "$PID_FILE" "$SINGBOX_BIN"; then
                     service_status="${GREEN}● 运行中${NC}"
                 else
                     service_status="${RED}○ 已停止${NC}"
@@ -4615,7 +5114,7 @@ _main_menu() {
             for pid_file in /tmp/singbox_argo_*.pid; do
                 [ -f "$pid_file" ] || continue
                 local pid=$(cat "$pid_file" 2>/dev/null)
-                if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                if _is_pid_running_cmd "$pid" "$CLOUDFLARED_BIN"; then
                     argo_running=true
                     break
                 fi
@@ -4653,7 +5152,7 @@ _main_menu() {
                     xray_status="${YELLOW}○ 已停止${NC}"
                 fi
             elif [ "$INIT_SYSTEM" == "direct" ]; then
-                if [ -s /tmp/xray.pid ] && kill -0 "$(cat /tmp/xray.pid 2>/dev/null)" 2>/dev/null; then
+                if _is_pid_file_running_cmd /tmp/xray.pid /usr/local/bin/xray; then
                     xray_status="${GREEN}● 运行中${NC}"
                 else
                     xray_status="${YELLOW}○ 已停止${NC}"
@@ -4969,8 +5468,8 @@ EOF
 _batch_create_nodes() {
     local input_str="$1"
     if [ -z "$input_str" ]; then
-        _info "请输入协议编号 (空格或逗号分隔，如: 1,5,8)"
-        _warn "注：批量部署不支持含有 CDN 的协议 (2, 3)"
+        _info "请输入协议编号 (空格或逗号分隔，如: 1,6,9)"
+        _warn "注：批量部署不支持含有 CDN 的协议 (2, 3, 4)"
         read -p "协议列表: " input_str
     fi
     [ -z "$input_str" ] && return 1
@@ -4985,18 +5484,22 @@ _batch_create_nodes() {
     local ss_occurences=0
 
     for pid in $proto_ids; do
-        if [[ "$pid" =~ ^(2|3)$ ]]; then
-            _error "协议 ID $pid (WebSocket+TLS) 不支持批量创建，请使用单节点模式单独创建以开启高级 CDN 优化。"
+        if [[ ! "$pid" =~ ^(1|2|3|4|5|6|7|8|9|10)$ ]]; then
+            _error "协议 ID $pid 无效，请输入 1-10 范围内的协议编号。"
+            return 1
+        fi
+        if [[ "$pid" =~ ^(2|3|4)$ ]]; then
+            _error "协议 ID $pid (WebSocket/gRPC+TLS) 不支持批量创建，请使用单节点模式单独创建以开启高级 CDN 优化。"
             return 1
         fi
         ((proto_count++))
-        if [[ "$pid" == "7" ]]; then
+        if [[ "$pid" == "8" ]]; then
             has_ss=true
             ((ss_occurences++))
         fi
-        [[ "$pid" =~ ^(5|7)$ ]] && has_complex=true
-        [[ "$pid" =~ ^(1|4|5|6)$ ]] && has_sni_req=true
-        [[ "$pid" == "5" ]] && has_hy2=true
+        [[ "$pid" =~ ^(6|8)$ ]] && has_complex=true
+        [[ "$pid" =~ ^(1|4|5|6|7)$ ]] && has_sni_req=true
+        [[ "$pid" == "6" ]] && has_hy2=true
     done
 
     [ $proto_count -eq 0 ] && { _error "未选择任何协议"; return 1; }
@@ -5055,12 +5558,45 @@ _batch_create_nodes() {
     while true; do
         read -p "请输入端口号 (范围如 10001-10010 或空格分隔): " p_input
         local current_p_list=()
+        local invalid_port=false
+        local duplicate_port=false
+        local occupied_port=false
+        local seen_ports=" "
+        p_input=$(echo "$p_input" | tr ',' ' ' | xargs)
+        [ -z "$p_input" ] && { _error "端口不能为空，请重新输入。"; continue; }
         if [[ "$p_input" == *"-"* ]]; then
             local start_p=$(echo $p_input | cut -d'-' -f1)
             local end_p=$(echo $p_input | cut -d'-' -f2)
+            if [[ ! "$start_p" =~ ^[0-9]+$ ]] || [[ ! "$end_p" =~ ^[0-9]+$ ]] || [ "$start_p" -lt 1 ] || [ "$end_p" -gt 65535 ] || [ "$start_p" -gt "$end_p" ]; then
+                _error "端口范围无效，应为 1-65535 内的 start-end。"
+                continue
+            fi
             for ((p=start_p; p<=end_p; p++)); do current_p_list+=($p); done
         else
             current_p_list=($p_input)
+        fi
+
+        local p
+        for p in "${current_p_list[@]}"; do
+            if [[ ! "$p" =~ ^[0-9]+$ ]] || [ "$p" -lt 1 ] || [ "$p" -gt 65535 ]; then
+                _error "端口 ${p} 无效，应为 1-65535。"
+                invalid_port=true
+                break
+            fi
+            if [[ "$seen_ports" == *" $p "* ]]; then
+                _error "端口 ${p} 重复，请重新输入。"
+                duplicate_port=true
+                break
+            fi
+            seen_ports="${seen_ports}${p} "
+            if _check_port_conflict "$p" "tcp" "true"; then
+                _error "端口 ${p} 已被占用，请重新输入。"
+                occupied_port=true
+                break
+            fi
+        done
+        if [ "$invalid_port" = true ] || [ "$duplicate_port" = true ] || [ "$occupied_port" = true ]; then
+            continue
         fi
         
         if [ ${#current_p_list[@]} -lt $proto_count ]; then
@@ -5077,7 +5613,7 @@ _batch_create_nodes() {
     for i in "${!proto_array[@]}"; do
         local pid=${proto_array[$i]}
         
-        if [ "$pid" == "7" ]; then
+        if [ "$pid" == "8" ]; then
             local ss_variants=$(echo "$ss_variant" | tr ',' ' ')
             for v in $ss_variants; do
                 local current_port=${ports_list[$bulk_idx]}
@@ -5101,17 +5637,18 @@ _batch_create_nodes() {
                 1) _add_vless_reality ;;
                 2) _add_vless_ws_tls ;;
                 3) _add_trojan_ws_tls ;;
-                4) _add_anytls ;;
-                5) _add_hysteria2 ;;
-                6) _add_tuic ;;
-                8) _add_vless_tcp ;;
-                9) _add_socks ;;
+                4) _add_vless_grpc_tls ;;
+                5) _add_anytls ;;
+                6) _add_hysteria2 ;;
+                7) _add_tuic ;;
+                9) _add_vless_tcp ;;
+                10) _add_socks ;;
             esac
             ((bulk_idx++))
         fi
     done
 
-    unset BATCH_MODE BATCH_PORT BATCH_SNI BATCH_HY2_OBFS BATCH_HY2_HOP BATCH_SS_VARIANT BATCH_ANYTLS_MODE BATCH_IP
+    unset BATCH_MODE BATCH_PORT BATCH_SNI BATCH_HY2_OBFS BATCH_HY2_HOP BATCH_SS_VARIANT BATCH_ANYTLS_MODE BATCH_IP BATCH_GRPC_TLS_DOMAIN BATCH_GRPC_SERVICE_NAME
     
     echo ""
     echo -e "${YELLOW}══════════════════ 批量创建完成提示 ══════════════════${NC}"
@@ -5139,23 +5676,24 @@ _show_add_node_menu() {
     echo -e "    ${GREEN}[1]${NC} VLESS (Vision+REALITY)"
     echo -e "    ${GREEN}[2]${NC} VLESS (WebSocket+TLS)"
     echo -e "    ${GREEN}[3]${NC} Trojan (WebSocket+TLS)"
-    echo -e "    ${GREEN}[4]${NC} AnyTLS"
-    echo -e "    ${GREEN}[5]${NC} Hysteria2"
-    echo -e "    ${GREEN}[6]${NC} TUICv5"
-    echo -e "    ${GREEN}[7]${NC} Shadowsocks"
-    echo -e "    ${GREEN}[8]${NC} VLESS (TCP)"
-    echo -e "    ${GREEN}[9]${NC} SOCKS5"
+    echo -e "    ${GREEN}[4]${NC} VLESS (gRPC+TLS)"
+    echo -e "    ${GREEN}[5]${NC} AnyTLS"
+    echo -e "    ${GREEN}[6]${NC} Hysteria2"
+    echo -e "    ${GREEN}[7]${NC} TUICv5"
+    echo -e "    ${GREEN}[8]${NC} Shadowsocks"
+    echo -e "    ${GREEN}[9]${NC} VLESS (TCP)"
+    echo -e "    ${GREEN}[10]${NC} SOCKS5"
     echo ""
     
     echo -e "  ${CYAN}【快捷功能】${NC}"
-    echo -e "   ${GREEN}[10]${NC} 批量创建节点"
+    echo -e "   ${GREEN}[11]${NC} 批量创建节点"
     echo ""
     
     echo -e "  ─────────────────────────────────────────"
     echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
     echo ""
     
-    read -p "  请输入选项 [0-10]: " choice
+    read -p "  请输入选项 [0-11]: " choice
 
     # 如果输入包含逗号或空格，自动进入批量处理模式
     if [[ "$choice" == *","* ]] || [[ "$choice" == *" "* ]]; then
@@ -5167,13 +5705,14 @@ _show_add_node_menu() {
         1) _add_vless_reality; action_result=$? ;;
         2) _add_vless_ws_tls; action_result=$? ;;
         3) _add_trojan_ws_tls; action_result=$? ;;
-        4) _add_anytls; action_result=$? ;;
-        5) _add_hysteria2; action_result=$? ;;
-        6) _add_tuic; action_result=$? ;;
-        7) _add_shadowsocks_menu; action_result=$? ;;
-        8) _add_vless_tcp; action_result=$? ;;
-        9) _add_socks; action_result=$? ;;
-        10) _batch_create_nodes; return ;;
+        4) _add_vless_grpc_tls; action_result=$? ;;
+        5) _add_anytls; action_result=$? ;;
+        6) _add_hysteria2; action_result=$? ;;
+        7) _add_tuic; action_result=$? ;;
+        8) _add_shadowsocks_menu; action_result=$? ;;
+        9) _add_vless_tcp; action_result=$? ;;
+        10) _add_socks; action_result=$? ;;
+        11) _batch_create_nodes; return ;;
         0) return ;;
         *) _error "无效输入，请重试。" ;;
     esac

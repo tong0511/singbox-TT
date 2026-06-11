@@ -109,9 +109,15 @@ if ! declare -f _atomic_modify_yaml >/dev/null 2>&1; then
     _atomic_modify_yaml() {
         local file="$1" filter="$2"
         [ ! -f "$file" ] && return 1
-        cp "$file" "${file}.tmp"
-        if ${YQ_BINARY} eval "$filter" -i "$file" 2>/dev/null; then rm "${file}.tmp"
-        else _error "修改YAML失败: $file"; mv "${file}.tmp" "$file"; return 1; fi
+        local tmp="${file}.tmp.$$"
+        cp "$file" "$tmp" || return 1
+        if ${YQ_BINARY} eval "$filter" -i "$file" 2>/dev/null; then
+            rm -f "$tmp"
+        else
+            _error "修改YAML失败: $file"
+            mv "$tmp" "$file"
+            return 1
+        fi
     }
 fi
 
@@ -121,8 +127,16 @@ if ! declare -f _add_node_to_yaml >/dev/null 2>&1; then
         local proxy_json="$1"
         local name=$(echo "$proxy_json" | jq -r '.name')
         local yaml_entry=$(echo "$proxy_json" | ${YQ_BINARY} -P '.')
-        echo "$yaml_entry" | ${YQ_BINARY} eval -i ".proxies += [load(\"/dev/stdin\")]" "$CLASH_YAML_FILE" 2>/dev/null || \
-        ${YQ_BINARY} eval -i ".proxies += [$(echo "$proxy_json" | ${YQ_BINARY} -P '.')]" "$CLASH_YAML_FILE" 2>/dev/null
+        local tmp="${CLASH_YAML_FILE}.tmp.$$"
+        cp "$CLASH_YAML_FILE" "$tmp" || return 1
+        if ! echo "$yaml_entry" | ${YQ_BINARY} eval -i ".proxies += [load(\"/dev/stdin\")]" "$CLASH_YAML_FILE" 2>/dev/null; then
+            if ! ${YQ_BINARY} eval -i ".proxies += [$(echo "$proxy_json" | ${YQ_BINARY} -P '.')]" "$CLASH_YAML_FILE" 2>/dev/null; then
+                _error "添加 YAML 节点失败: $name"
+                mv "$tmp" "$CLASH_YAML_FILE"
+                return 1
+            fi
+        fi
+        rm -f "$tmp"
         export NODE_NAME="$name"
         _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxy-groups[] | select(.name == "节点选择") | .proxies) += [env(NODE_NAME)]'
     }
@@ -154,6 +168,27 @@ _check_port_occupied() {
         netstat -tlnp 2>/dev/null | grep -q ":${port} " && return 0
     fi
     return 1
+}
+
+_is_pid_running_cmd() {
+    local pid="$1"
+    local pattern="$2"
+    [ -n "$pid" ] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    if [ -r "/proc/${pid}/cmdline" ]; then
+        tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null | grep -Fq "$pattern"
+    else
+        ps -p "$pid" -o args= 2>/dev/null | grep -Fq "$pattern"
+    fi
+}
+
+_is_pid_file_running_cmd() {
+    local pid_file="$1"
+    local pattern="$2"
+    local pid
+    [ -s "$pid_file" ] || return 1
+    pid=$(cat "$pid_file" 2>/dev/null)
+    _is_pid_running_cmd "$pid" "$pattern"
 }
 
 _check_xray_port_conflict() {
@@ -311,9 +346,10 @@ _manage_xray_service() {
         local log_file="/var/log/xray.log"
         case "$action" in
             start)
-                if [ -s "$pid_file" ] && kill -0 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null; then
+                if _is_pid_file_running_cmd "$pid_file" "$XRAY_BIN"; then
                     :
                 else
+                    rm -f "$pid_file"
                     nohup "$XRAY_BIN" run -c "$XRAY_CONFIG" >> "$log_file" 2>&1 &
                     echo $! > "$pid_file"
                 fi
@@ -322,7 +358,9 @@ _manage_xray_service() {
                 if [ -s "$pid_file" ]; then
                     local pid
                     pid=$(cat "$pid_file" 2>/dev/null)
-                    [ -n "$pid" ] && kill "$pid" 2>/dev/null
+                    if _is_pid_running_cmd "$pid" "$XRAY_BIN"; then
+                        kill "$pid" 2>/dev/null
+                    fi
                 fi
                 rm -f "$pid_file"
                 ;;
@@ -332,10 +370,11 @@ _manage_xray_service() {
                 _manage_xray_service start
                 ;;
             status)
-                if [ -s "$pid_file" ] && kill -0 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null; then
+                if _is_pid_file_running_cmd "$pid_file" "$XRAY_BIN"; then
                     _success "Xray direct 后台模式运行中 (PID: $(cat "$pid_file"))"
                     return 0
                 fi
+                rm -f "$pid_file"
                 _warn "Xray direct 后台模式未运行。"
                 return 1
                 ;;
@@ -621,7 +660,7 @@ _add_vless_grpc_reality() {
           network:"grpc", "grpc-opts":{"grpc-service-name":$svc}}')
     _add_node_to_yaml "$proxy_json"
     
-    local link="vless://${uuid}@${link_ip}:${port}?security=reality&encryption=none&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&fp=chrome&type=grpc&serviceName=${service_name}&sni=${sni}&sid=${REALITY_SHORT_ID}#$(_url_encode "$name")"
+    local link="vless://${uuid}@${link_ip}:${port}?security=reality&encryption=none&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&fp=chrome&type=grpc&serviceName=${service_name}&authority=${sni}&sni=${sni}&sid=${REALITY_SHORT_ID}#$(_url_encode "$name")"
     
     _save_xray_meta "$tag" "$name" "$link" "publicKey=$REALITY_PUBLIC_KEY" "shortId=$REALITY_SHORT_ID"
     
@@ -728,7 +767,7 @@ _add_trojan_grpc_reality() {
           network:"grpc", "grpc-opts":{"grpc-service-name":$svc}}')
     _add_node_to_yaml "$proxy_json"
     
-    local link="trojan://${password}@${link_ip}:${port}?security=reality&type=grpc&serviceName=${service_name}&sni=${sni}&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&fp=chrome&sid=${REALITY_SHORT_ID}#$(_url_encode "$name")"
+    local link="trojan://${password}@${link_ip}:${port}?security=reality&type=grpc&serviceName=${service_name}&authority=${sni}&sni=${sni}&pbk=$(_url_encode "$REALITY_PUBLIC_KEY")&fp=chrome&sid=${REALITY_SHORT_ID}#$(_url_encode "$name")"
     
     _save_xray_meta "$tag" "$name" "$link" "publicKey=$REALITY_PUBLIC_KEY" "shortId=$REALITY_SHORT_ID"
     
@@ -905,13 +944,22 @@ _add_vless_h2_tls() {
     # Clash YAML - mihomo 不支持 XHTTP，跳过写入
     _warn "mihomo/Clash 不支持 XHTTP 传输层，此节点仅支持 V2rayN/Xray 客户端"
     
-    local link="vless://${uuid}@${link_ip}:${port}?security=tls&encryption=none&sni=${sni}&alpn=h2&type=xhttp&mode=stream-one&path=$(_url_encode "$path")&host=${sni}#$(_url_encode "$name")"
+    local cert_pcs=$(_cert_sha256_hex "$cert_path")
+    local insecure_param=""
+    [ -n "$cert_pcs" ] && insecure_param="${insecure_param}&pcs=${cert_pcs}"
+    local link="vless://${uuid}@${link_ip}:${port}?security=tls&encryption=none&sni=${sni}&alpn=h2&type=xhttp&mode=stream-one&path=$(_url_encode "$path")&host=${sni}${insecure_param}#$(_url_encode "$name")"
     
     _save_xray_meta "$tag" "$name" "$link"
     
     _info "此节点支持 CF CDN 回源 (SSL模式设为 Full)"
     _success "VLESS+H2+TLS 节点 [${name}] 添加成功！"
-    echo -e "  ${YELLOW}分享链接:${NC} ${link}"
+    local clean_link=$(echo "$link" | sed 's/&pcs=[a-fA-F0-9]*//g')
+    if [ "$clean_link" != "$link" ]; then
+        echo -e "  ${YELLOW}直连分享链接 (含指纹):${NC} ${link}"
+        echo -e "  ${YELLOW}CF优选专用链接 (无指纹):${NC} ${clean_link}"
+    else
+        echo -e "  ${YELLOW}分享链接:${NC} ${link}"
+    fi
 }
 
 # ============================================================
@@ -980,13 +1028,22 @@ _add_vless_grpc_tls() {
           "grpc-opts":{"grpc-service-name":$svc}}')
     _add_node_to_yaml "$proxy_json"
     
-    local link="vless://${uuid}@${link_ip}:${port}?security=tls&encryption=none&sni=${sni}&type=grpc&serviceName=${service_name}#$(_url_encode "$name")"
+    local cert_pcs=$(_cert_sha256_hex "$cert_path")
+    local insecure_param=""
+    [ -n "$cert_pcs" ] && insecure_param="${insecure_param}&pcs=${cert_pcs}"
+    local link="vless://${uuid}@${link_ip}:${port}?security=tls&encryption=none&sni=${sni}&type=grpc&serviceName=${service_name}&authority=${sni}${insecure_param}#$(_url_encode "$name")"
     
     _save_xray_meta "$tag" "$name" "$link"
     
     _info "此节点支持 CF CDN 回源 (需在CF开启gRPC支持, SSL模式设为 Full)"
     _success "VLESS+gRPC+TLS 节点 [${name}] 添加成功！"
-    echo -e "  ${YELLOW}分享链接:${NC} ${link}"
+    local clean_link=$(echo "$link" | sed 's/&pcs=[a-fA-F0-9]*//g')
+    if [ "$clean_link" != "$link" ]; then
+        echo -e "  ${YELLOW}直连分享链接 (含指纹):${NC} ${link}"
+        echo -e "  ${YELLOW}CF优选专用链接 (无指纹):${NC} ${clean_link}"
+    else
+        echo -e "  ${YELLOW}分享链接:${NC} ${link}"
+    fi
 }
 
 # ============================================================
@@ -1054,13 +1111,22 @@ _add_trojan_grpc_tls() {
           "grpc-opts":{"grpc-service-name":$svc}}')
     _add_node_to_yaml "$proxy_json"
     
-    local link="trojan://${password}@${link_ip}:${port}?security=tls&type=grpc&serviceName=${service_name}&sni=${sni}#$(_url_encode "$name")"
+    local cert_pcs=$(_cert_sha256_hex "$cert_path")
+    local insecure_param=""
+    [ -n "$cert_pcs" ] && insecure_param="${insecure_param}&pcs=${cert_pcs}"
+    local link="trojan://${password}@${link_ip}:${port}?security=tls&type=grpc&serviceName=${service_name}&authority=${sni}&sni=${sni}${insecure_param}#$(_url_encode "$name")"
     
     _save_xray_meta "$tag" "$name" "$link"
     
     _info "此节点支持 CF CDN 回源 (需在CF开启gRPC支持, SSL模式设为 Full)"
     _success "Trojan+gRPC+TLS 节点 [${name}] 添加成功！"
-    echo -e "  ${YELLOW}分享链接:${NC} ${link}"
+    local clean_link=$(echo "$link" | sed 's/&pcs=[a-fA-F0-9]*//g')
+    if [ "$clean_link" != "$link" ]; then
+        echo -e "  ${YELLOW}直连分享链接 (含指纹):${NC} ${link}"
+        echo -e "  ${YELLOW}CF优选专用链接 (无指纹):${NC} ${clean_link}"
+    else
+        echo -e "  ${YELLOW}分享链接:${NC} ${link}"
+    fi
 }
 
 # ============================================================
@@ -1072,18 +1138,13 @@ _view_xray_nodes() {
         _warn "当前没有 Xray 节点。"
         return
     fi
+    [ -f "$XRAY_METADATA" ] || echo '{}' > "$XRAY_METADATA"
     echo ""
     echo -e "${YELLOW}══════════════════ Xray 节点列表 ══════════════════${NC}"
     local count=0
-    local tags=$(jq -r '.inbounds[].tag' "$XRAY_CONFIG" 2>/dev/null)
-    for tag in $tags; do
+    while IFS=$'\t' read -r tag protocol port network security name link; do
+        [ -z "$tag" ] && continue
         count=$((count + 1))
-        local protocol=$(jq -r ".inbounds[] | select(.tag == \"$tag\") | .protocol" "$XRAY_CONFIG")
-        local port=$(jq -r ".inbounds[] | select(.tag == \"$tag\") | .port" "$XRAY_CONFIG")
-        local network=$(jq -r ".inbounds[] | select(.tag == \"$tag\") | .streamSettings.network // \"tcp\"" "$XRAY_CONFIG")
-        local security=$(jq -r ".inbounds[] | select(.tag == \"$tag\") | .streamSettings.security // \"none\"" "$XRAY_CONFIG")
-        local name=$(jq -r ".\"$tag\".name // \"$tag\"" "$XRAY_METADATA" 2>/dev/null)
-        local link=$(jq -r ".\"$tag\".share_link // empty" "$XRAY_METADATA" 2>/dev/null)
         local desc="${protocol}"
         [ "$network" != "null" ] && [ "$network" != "tcp" ] && desc="${desc}+${network}"
         [ "$security" != "null" ] && [ "$security" != "none" ] && desc="${desc}+${security}"
@@ -1091,7 +1152,20 @@ _view_xray_nodes() {
         echo -e "  ${GREEN}[${count}]${NC} ${CYAN}${name}${NC}"
         echo -e "      协议: ${YELLOW}${desc}${NC}  |  端口: ${GREEN}${port}${NC}  |  标签: ${CYAN}${tag}${NC}"
         [ -n "$link" ] && echo -e "      ${YELLOW}分享链接:${NC} ${link}"
-    done
+    done < <(jq -r --slurpfile meta "$XRAY_METADATA" '
+        .inbounds[] |
+        . as $in |
+        ($meta[0][$in.tag] // {}) as $m |
+        [
+            $in.tag,
+            $in.protocol,
+            ($in.port|tostring),
+            ($in.streamSettings.network // "tcp"),
+            ($in.streamSettings.security // "none"),
+            ($m.name // $in.tag),
+            ($m.share_link // "")
+        ] | @tsv
+    ' "$XRAY_CONFIG" 2>/dev/null)
     echo ""
     echo -e "${YELLOW}════════════════════════════════════════════════════${NC}"
     echo -e "  共 ${GREEN}${count}${NC} 个 Xray 节点"
@@ -1101,15 +1175,25 @@ _delete_xray_node() {
     if [ ! -f "$XRAY_CONFIG" ] || ! jq -e '.inbounds | length > 0' "$XRAY_CONFIG" >/dev/null 2>&1; then
         _warn "当前没有 Xray 节点可删除。"; return
     fi
-    local tags=($(jq -r '.inbounds[].tag' "$XRAY_CONFIG" 2>/dev/null))
+    [ -f "$XRAY_METADATA" ] || echo '{}' > "$XRAY_METADATA"
+    local tags=()
+    local names=()
+    local ports=()
     echo ""
     echo -e "${YELLOW}══════════ 选择要删除的节点 ══════════${NC}"
-    for i in "${!tags[@]}"; do
-        local tag="${tags[$i]}"
-        local port=$(jq -r ".inbounds[] | select(.tag == \"$tag\") | .port" "$XRAY_CONFIG")
-        local name=$(jq -r ".\"$tag\".name // \"$tag\"" "$XRAY_METADATA" 2>/dev/null)
-        echo -e "  ${GREEN}[$((i+1))]${NC} ${name} (端口: ${port})"
-    done
+    while IFS=$'\t' read -r tag port name; do
+        [ -z "$tag" ] && continue
+        tags+=("$tag")
+        ports+=("$port")
+        names+=("$name")
+        local i=${#tags[@]}
+        echo -e "  ${GREEN}[${i}]${NC} ${name} (端口: ${port})"
+    done < <(jq -r --slurpfile meta "$XRAY_METADATA" '
+        .inbounds[] |
+        . as $in |
+        ($meta[0][$in.tag] // {}) as $m |
+        [$in.tag, ($in.port|tostring), ($m.name // $in.tag)] | @tsv
+    ' "$XRAY_CONFIG" 2>/dev/null)
     echo -e "  ${RED}[99]${NC} 删除全部节点"
     echo -e "  ${RED}[0]${NC} 返回"
     echo ""
@@ -1120,7 +1204,7 @@ _delete_xray_node() {
         _error "无效选择！"; return
     fi
     local target_tag="${tags[$((choice-1))]}"
-    local target_name=$(jq -r ".\"$target_tag\".name // \"$target_tag\"" "$XRAY_METADATA" 2>/dev/null)
+    local target_name="${names[$((choice-1))]}"
     read -p "$(echo -e ${RED}"确定删除 [$target_name]? (y/N): "${NC})" confirm
     [[ "$confirm" != "y" && "$confirm" != "Y" ]] && { _info "已取消。"; return; }
     [ -n "$target_name" ] && [ "$target_name" != "null" ] && _remove_node_from_yaml "$target_name"
@@ -1155,15 +1239,25 @@ _modify_xray_port() {
     if [ ! -f "$XRAY_CONFIG" ] || ! jq -e '.inbounds | length > 0' "$XRAY_CONFIG" >/dev/null 2>&1; then
         _warn "当前没有 Xray 节点。"; return
     fi
-    local tags=($(jq -r '.inbounds[].tag' "$XRAY_CONFIG" 2>/dev/null))
+    [ -f "$XRAY_METADATA" ] || echo '{}' > "$XRAY_METADATA"
+    local tags=()
+    local names=()
+    local ports=()
     echo ""
     echo -e "${YELLOW}══════════ 选择要修改端口的节点 ══════════${NC}"
-    for i in "${!tags[@]}"; do
-        local tag="${tags[$i]}"
-        local port=$(jq -r ".inbounds[] | select(.tag == \"$tag\") | .port" "$XRAY_CONFIG")
-        local name=$(jq -r ".\"$tag\".name // \"$tag\"" "$XRAY_METADATA" 2>/dev/null)
-        echo -e "  ${GREEN}[$((i+1))]${NC} ${name} (端口: ${port})"
-    done
+    while IFS=$'\t' read -r tag port name; do
+        [ -z "$tag" ] && continue
+        tags+=("$tag")
+        ports+=("$port")
+        names+=("$name")
+        local i=${#tags[@]}
+        echo -e "  ${GREEN}[${i}]${NC} ${name} (端口: ${port})"
+    done < <(jq -r --slurpfile meta "$XRAY_METADATA" '
+        .inbounds[] |
+        . as $in |
+        ($meta[0][$in.tag] // {}) as $m |
+        [$in.tag, ($in.port|tostring), ($m.name // $in.tag)] | @tsv
+    ' "$XRAY_CONFIG" 2>/dev/null)
     echo -e "  ${RED}[0]${NC} 返回"
     echo ""
     read -p "请选择 [0-${#tags[@]}]: " choice
@@ -1172,8 +1266,8 @@ _modify_xray_port() {
         _error "无效选择！"; return
     fi
     local target_tag="${tags[$((choice-1))]}"
-    local old_port=$(jq -r ".inbounds[] | select(.tag == \"$target_tag\") | .port" "$XRAY_CONFIG")
-    local target_name=$(jq -r ".\"$target_tag\".name // \"$target_tag\"" "$XRAY_METADATA" 2>/dev/null)
+    local old_port="${ports[$((choice-1))]}"
+    local target_name="${names[$((choice-1))]}"
     _info "当前端口: ${old_port}"
     local new_port=$(_input_port)
     
@@ -1192,6 +1286,7 @@ _modify_xray_port() {
         if [ "$new_name" != "$target_name" ]; then
             export NEW_NAME="$new_name"
             _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(MOD_NAME)) | .name) = env(NEW_NAME)'
+            _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxy-groups[].proxies[] | select(. == env(MOD_NAME))) = env(NEW_NAME)'
         fi
     fi
     
@@ -1282,7 +1377,7 @@ _xray_menu() {
             elif [ "$INIT_SYSTEM" == "openrc" ]; then
                 rc-service xray status >/dev/null 2>&1 && xray_status="${GREEN}运行中${NC} (v${xray_ver})" || xray_status="${YELLOW}已停止${NC} (v${xray_ver})"
             else
-                [ -s /tmp/xray.pid ] && kill -0 "$(cat /tmp/xray.pid 2>/dev/null)" 2>/dev/null && xray_status="${GREEN}运行中${NC} (v${xray_ver})" || xray_status="${YELLOW}已停止${NC} (v${xray_ver})"
+                _is_pid_file_running_cmd /tmp/xray.pid "$XRAY_BIN" && xray_status="${GREEN}运行中${NC} (v${xray_ver})" || xray_status="${YELLOW}已停止${NC} (v${xray_ver})"
             fi
         fi
         local node_count=$(jq '.inbounds | length' "$XRAY_CONFIG" 2>/dev/null || echo "0")

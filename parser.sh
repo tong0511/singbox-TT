@@ -21,7 +21,15 @@ _decode() { _url_decode "$1"; }
 _get_param() {
     local params="$1"
     local key="$2"
-    echo "$params" | sed -n "s/.*[\?&]${key}=\([^&]*\).*/\1/p"
+    local pair
+    params="${params#\?}"
+    IFS='&' read -ra _param_pairs <<< "$params"
+    for pair in "${_param_pairs[@]}"; do
+        if [[ "$pair" == "$key="* ]]; then
+            _url_decode "${pair#*=}"
+            return
+        fi
+    done
 }
 
 _strip_ipv6_brackets() {
@@ -94,7 +102,7 @@ _parse_vless() {
         local sid=$(_get_param "$params" "sid")
         local fp=$(_get_param "$params" "fp")
         local type=$(_get_param "$params" "type")
-        local path=$(_decode "$(_get_param "$params" "path")")
+        local path=$(_get_param "$params" "path")
         local host=$(_get_param "$params" "host")
 
         local outbound=$(jq -n \
@@ -164,7 +172,7 @@ _parse_trojan() {
 
         local sni=$(_get_param "$params" "sni")
         local type=$(_get_param "$params" "type")
-        local path=$(_decode "$(_get_param "$params" "path")")
+        local path=$(_get_param "$params" "path")
         local host=$(_get_param "$params" "host")
 
         local outbound=$(jq -n --arg s "$server" --argjson p "$port" --arg pw "$password" \
