@@ -614,6 +614,7 @@ export CLASH_YAML_FILE="${SINGBOX_DIR}/clash.yaml"
 export METADATA_FILE="${SINGBOX_DIR}/metadata.json"
 export ARGO_METADATA_FILE="${SINGBOX_DIR}/argo_metadata.json"
 export LOG_FILE="/var/log/sing-box.log"
+export ARGO_LOG_FILE="/var/log/singbox_argo.log"
 export PID_FILE="/tmp/sing-box.pid"
 export CLOUDFLARED_BIN="/usr/local/bin/cloudflared"
 export DEP_STATE_FILE="${SINGBOX_DIR}/dependencies.ok"
@@ -1560,22 +1561,28 @@ _restart_argo_tunnel_menu() {
 
 _argo_keepalive() {
     # --- 性能优化: 互斥锁 ---
-    local lock_file="/tmp/singbox_keepalive.lock"
-    if [ -f "$lock_file" ]; then
-        local pid=$(cat "$lock_file")
-        if kill -0 "$pid" 2>/dev/null; then
+    local lock_dir="/tmp/singbox_keepalive.lock"
+    if ! mkdir "$lock_dir" 2>/dev/null; then
+        # 锁目录存在，等待所有权文件写入
+        sleep 0.1 2>/dev/null || sleep 1
+        local pid=""
+        [ -f "$lock_dir/pid" ] && pid=$(cat "$lock_dir/pid" 2>/dev/null)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
             # 进程仍在运行，跳过本次执行
             return
         fi
+        # 进程已死，强制清除残留锁目录并重试
+        rm -rf "$lock_dir" 2>/dev/null
+        mkdir -p "$lock_dir" 2>/dev/null || return
     fi
-    echo "$$" > "$lock_file"
+    echo "$$" > "$lock_dir/pid"
     # 确保退出时删除锁
-    trap 'rm -f "$lock_file"' RETURN EXIT
+    trap 'rm -rf "$lock_dir"' RETURN EXIT
 
     # --- 性能优化: 日志轮转 (10MB) ---
     local max_size=$((10 * 1024 * 1024))
     for log in "$LOG_FILE" "$ARGO_LOG_FILE"; do
-        if [ -f "$log" ] && [ $(stat -c%s "$log" 2>/dev/null || echo 0) -ge $max_size ]; then
+        if [ -f "$log" ] && [ $(wc -c < "$log" 2>/dev/null || echo 0) -ge $max_size ]; then
             tail -n 1000 "$log" > "${log}.tmp" && mv "${log}.tmp" "$log"
         fi
     done
@@ -2069,20 +2076,15 @@ _initialize_config_files() {
   "dns": {
     "servers": [
       {
-        "tag": "dns-cloudflare",
-        "address": "https://1.1.1.1/dns-query",
-        "detour": "direct"
-      },
-      {
-        "tag": "dns-aliyun",
-        "address": "https://223.5.5.5/dns-query",
+        "tag": "dns-local",
+        "address": "local",
         "detour": "direct"
       }
     ],
     "rules": [
       {
         "outbound": "any",
-        "server": "dns-cloudflare"
+        "server": "dns-local"
       }
     ],
     "strategy": "ipv4_only"
@@ -2267,10 +2269,9 @@ _check_and_fix_dns() {
         jq '. + {
             "dns": {
                 "servers": [
-                    {"tag": "dns-cloudflare", "address": "https://1.1.1.1/dns-query", "detour": "direct"},
-                    {"tag": "dns-aliyun", "address": "https://223.5.5.5/dns-query", "detour": "direct"}
+                    {"tag": "dns-local", "address": "local", "detour": "direct"}
                 ],
-                "rules": [{"outbound": "any", "server": "dns-cloudflare"}],
+                "rules": [{"outbound": "any", "server": "dns-local"}],
                 "strategy": "ipv4_only"
             }
         } | del(.route.auto_detect_interface)' "$CONFIG_FILE" > "$tmp_file"
@@ -2464,7 +2465,7 @@ _show_node_link() {
     if [ -n "$url" ]; then
         echo ""
         local clean_url=$(echo "$url" | sed 's/&insecure=1//g' | sed 's/&pcs=[a-fA-F0-9]*//g')
-        if [ "$clean_url" != "$url" ] && [[ "$url" != *"vless-reality"* ]] && [[ "$url" != *"any-reality"* ]]; then
+        if [ "$clean_url" != "$url" ] && [[ "$type" != "anytls" ]] && [[ "$type" != "hysteria2" ]] && [[ "$type" != "tuic" ]] && [[ "$type" != "vless-reality" ]] && [[ "$type" != "any-reality" ]]; then
             echo -e "${YELLOW}═══════════════ 🔗 直连分享链接 (含防劫持指纹) ═══════════════${NC}"
             echo -e "${CYAN}${url}${NC}"
             echo -e "${YELLOW}══════════════════════════════════════════════════════════════${NC}"

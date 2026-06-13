@@ -21,6 +21,15 @@ _url_encode() {
     printf '%s' "$1" | jq -sRr @uri
 }
 
+if ! declare -f _cert_sha256_hex >/dev/null 2>&1; then
+    _cert_sha256_hex() {
+        local cert_path="$1"
+        [ -f "$cert_path" ] || return 1
+        openssl x509 -in "$cert_path" -noout -fingerprint -sha256 2>/dev/null | \
+            awk -F= 'NR==1 { gsub(":", "", $2); print tolower($2) }'
+    }
+fi
+
 # 打印消息函数 (强制重定向到 stderr，防止干扰变量捕获)
 if ! declare -f _info >/dev/null; then
     _info() { echo -e "${CYAN}[信息] $1${NC}" >&2; }
@@ -972,7 +981,10 @@ _finalize_relay_setup() {
         inbound_json=$(jq -n --arg t "$inbound_tag" --arg p "$listen_port" --arg pw "$password" --arg sn "$entrance_sni" --arg cert "$cert_path" --arg key "$key_path" \
             '{"type":"hysteria2","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"password":$pw}],"tls":{"enabled":true,"server_name":$sn,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}}')
 
-        link="hysteria2://${password}@${link_ip}:${listen_port}?sni=${entrance_sni}&insecure=1&up=10000&down=10000${hop_str}#$(_url_encode "${node_name}")"
+        local cert_pcs=$(_cert_sha256_hex "$cert_path")
+        local pin_param=""
+        [ -n "$cert_pcs" ] && pin_param="&pinSHA256=${cert_pcs}"
+        link="hysteria2://${password}@${link_ip}:${listen_port}?sni=${entrance_sni}&insecure=1&up=10000&down=10000${hop_str}${pin_param}#$(_url_encode "${node_name}")"
         
     elif [ "$relay_type" == "tuic" ]; then
         local uuid=$($SINGBOX_BIN generate uuid)
@@ -987,7 +999,10 @@ _finalize_relay_setup() {
         inbound_json=$(jq -n --arg t "$inbound_tag" --arg p "$listen_port" --arg pw "$password" --arg sn "$entrance_sni" --arg cert "$cert_path" --arg key "$key_path" \
             '{"type":"anytls","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"name":"default","password":$pw}],"padding_scheme":["stop=2","0=100-200","1=100-200"],"tls":{"enabled":true,"server_name":$sn,"certificate_path":$cert,"key_path":$key}}')
             
-        link="anytls://${password}@${link_ip}:${listen_port}?security=tls&sni=${entrance_sni}&insecure=1&type=tcp#$(_url_encode "${node_name}")"
+        local cert_pcs=$(_cert_sha256_hex "$cert_path")
+        local pin_param=""
+        [ -n "$cert_pcs" ] && pin_param="&pcs=${cert_pcs}"
+        link="anytls://${password}@${link_ip}:${listen_port}?security=tls&sni=${entrance_sni}&insecure=1&type=tcp${pin_param}#$(_url_encode "${node_name}")"
     fi
     
     # 2. 写入配置到主配置文件
@@ -1396,11 +1411,11 @@ _modify_relay_port() {
             local current_link=$(jq -r ".\"$in_tag\".link // \"\"" "$LINKS_FILE")
             
             # 生成新节点说明名字 (替换端口数字)
-            new_node_name=$(echo "$old_node_name" | sed "s/${old_port}/${new_port}/g")
+            new_node_name="${old_node_name//$old_port/$new_port}"
             
             # 1. 链接备注与端口同步
             if [ -n "$current_link" ]; then
-                local new_link=$(echo "$current_link" | sed "s/${old_port}/${new_port}/g")
+                local new_link=$(echo "$current_link" | sed -E "s/(:${old_port})([?&#\/]|$)/:${new_port}\2/g; s/(-${old_port})([?&#\/]|$)/-${new_port}\2/g")
                 _atomic_modify_json "$LINKS_FILE" ".\"$in_tag\".link = \"$new_link\""
             fi
             

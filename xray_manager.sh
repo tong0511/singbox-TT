@@ -40,6 +40,15 @@ if ! declare -f _url_encode >/dev/null 2>&1; then
     }
 fi
 
+if ! declare -f _cert_sha256_hex >/dev/null 2>&1; then
+    _cert_sha256_hex() {
+        local cert_path="$1"
+        [ -f "$cert_path" ] || return 1
+        openssl x509 -in "$cert_path" -noout -fingerprint -sha256 2>/dev/null | \
+            awk -F= 'NR==1 { gsub(":", "", $2); print tolower($2) }'
+    }
+fi
+
 if ! declare -f _release_install_cache >/dev/null 2>&1; then
     _release_install_cache() {
         sync 2>/dev/null || true
@@ -945,7 +954,7 @@ _add_vless_h2_tls() {
     _warn "mihomo/Clash 不支持 XHTTP 传输层，此节点仅支持 V2rayN/Xray 客户端"
     
     local cert_pcs=$(_cert_sha256_hex "$cert_path")
-    local insecure_param=""
+    local insecure_param="&insecure=1"
     [ -n "$cert_pcs" ] && insecure_param="${insecure_param}&pcs=${cert_pcs}"
     local link="vless://${uuid}@${link_ip}:${port}?security=tls&encryption=none&sni=${sni}&alpn=h2&type=xhttp&mode=stream-one&path=$(_url_encode "$path")&host=${sni}${insecure_param}#$(_url_encode "$name")"
     
@@ -953,7 +962,7 @@ _add_vless_h2_tls() {
     
     _info "此节点支持 CF CDN 回源 (SSL模式设为 Full)"
     _success "VLESS+H2+TLS 节点 [${name}] 添加成功！"
-    local clean_link=$(echo "$link" | sed 's/&pcs=[a-fA-F0-9]*//g')
+    local clean_link=$(echo "$link" | sed -E 's/&pcs=[a-fA-F0-9]*//g; s/&insecure=1//g')
     if [ "$clean_link" != "$link" ]; then
         echo -e "  ${YELLOW}直连分享链接 (含指纹):${NC} ${link}"
         echo -e "  ${YELLOW}CF优选专用链接 (无指纹):${NC} ${clean_link}"
@@ -1029,7 +1038,7 @@ _add_vless_grpc_tls() {
     _add_node_to_yaml "$proxy_json"
     
     local cert_pcs=$(_cert_sha256_hex "$cert_path")
-    local insecure_param=""
+    local insecure_param="&insecure=1"
     [ -n "$cert_pcs" ] && insecure_param="${insecure_param}&pcs=${cert_pcs}"
     local link="vless://${uuid}@${link_ip}:${port}?security=tls&encryption=none&sni=${sni}&type=grpc&serviceName=${service_name}&authority=${sni}${insecure_param}#$(_url_encode "$name")"
     
@@ -1037,7 +1046,7 @@ _add_vless_grpc_tls() {
     
     _info "此节点支持 CF CDN 回源 (需在CF开启gRPC支持, SSL模式设为 Full)"
     _success "VLESS+gRPC+TLS 节点 [${name}] 添加成功！"
-    local clean_link=$(echo "$link" | sed 's/&pcs=[a-fA-F0-9]*//g')
+    local clean_link=$(echo "$link" | sed -E 's/&pcs=[a-fA-F0-9]*//g; s/&insecure=1//g')
     if [ "$clean_link" != "$link" ]; then
         echo -e "  ${YELLOW}直连分享链接 (含指纹):${NC} ${link}"
         echo -e "  ${YELLOW}CF优选专用链接 (无指纹):${NC} ${clean_link}"
@@ -1112,7 +1121,7 @@ _add_trojan_grpc_tls() {
     _add_node_to_yaml "$proxy_json"
     
     local cert_pcs=$(_cert_sha256_hex "$cert_path")
-    local insecure_param=""
+    local insecure_param="&insecure=1"
     [ -n "$cert_pcs" ] && insecure_param="${insecure_param}&pcs=${cert_pcs}"
     local link="trojan://${password}@${link_ip}:${port}?security=tls&type=grpc&serviceName=${service_name}&authority=${sni}&sni=${sni}${insecure_param}#$(_url_encode "$name")"
     
@@ -1120,7 +1129,7 @@ _add_trojan_grpc_tls() {
     
     _info "此节点支持 CF CDN 回源 (需在CF开启gRPC支持, SSL模式设为 Full)"
     _success "Trojan+gRPC+TLS 节点 [${name}] 添加成功！"
-    local clean_link=$(echo "$link" | sed 's/&pcs=[a-fA-F0-9]*//g')
+    local clean_link=$(echo "$link" | sed -E 's/&pcs=[a-fA-F0-9]*//g; s/&insecure=1//g')
     if [ "$clean_link" != "$link" ]; then
         echo -e "  ${YELLOW}直连分享链接 (含指纹):${NC} ${link}"
         echo -e "  ${YELLOW}CF优选专用链接 (无指纹):${NC} ${clean_link}"
@@ -1294,7 +1303,7 @@ _modify_xray_port() {
     local old_link=$(jq -r ".\"$target_tag\".share_link // empty" "$XRAY_METADATA" 2>/dev/null)
     local new_link=""
     if [ -n "$old_link" ]; then
-        new_link=$(echo "$old_link" | sed "s/:${old_port}/:${new_port}/g; s/-${old_port}/-${new_port}/g; s/#[^#]*$/#$(_url_encode "$new_name")/g")
+        new_link=$(echo "$old_link" | sed -E "s/(:${old_port})([?&#\/]|$)/:${new_port}\2/g; s/(-${old_port})([?&#\/]|$)/-${new_port}\2/g; s/#[^#]*$/#$(_url_encode "$new_name")/g")
     fi
     # 用新 tag 作为 key，删除旧 key
     local tmp="${XRAY_METADATA}.tmp.$$"

@@ -104,6 +104,8 @@ _parse_vless() {
         local type=$(_get_param "$params" "type")
         local path=$(_get_param "$params" "path")
         local host=$(_get_param "$params" "host")
+        local insecure=$(_get_param "$params" "insecure")
+        [ -z "$insecure" ] && insecure=$(_get_param "$params" "allowInsecure")
 
         local outbound=$(jq -n \
             --arg type "vless" \
@@ -123,8 +125,10 @@ _parse_vless() {
             outbound=$(echo "$outbound" | jq --arg sni "$target_sni" --arg pbk "$pbk" --arg sid "$sid" --arg fp "${fp:-"chrome"}" \
                 '.tls = {enabled:true, server_name:$sni, reality:{enabled:true, public_key:$pbk, short_id:$sid}, utls:{enabled:true, fingerprint:$fp}}')
         elif [ "$security" == "tls" ]; then
-            outbound=$(echo "$outbound" | jq --arg sni "$target_sni" --arg fp "${fp:-"chrome"}" \
-                '.tls = {enabled:true, server_name:$sni, utls:{enabled:true, fingerprint:$fp}}')
+            local is_insecure="false"
+            [[ "$insecure" == "1" || "$insecure" == "true" ]] && is_insecure="true"
+            outbound=$(echo "$outbound" | jq --arg sni "$target_sni" --arg fp "${fp:-"chrome"}" --argjson ins "$is_insecure" \
+                '.tls = {enabled:true, server_name:$sni, utls:{enabled:true, fingerprint:$fp}, insecure:$ins}')
         fi
         echo "$outbound"
     fi
@@ -174,6 +178,8 @@ _parse_trojan() {
         local type=$(_get_param "$params" "type")
         local path=$(_get_param "$params" "path")
         local host=$(_get_param "$params" "host")
+        local insecure=$(_get_param "$params" "insecure")
+        [ -z "$insecure" ] && insecure=$(_get_param "$params" "allowInsecure")
 
         local outbound=$(jq -n --arg s "$server" --argjson p "$port" --arg pw "$password" \
             '{type:"trojan", tag:"proxy", server:$s, server_port:$p, password:$pw}')
@@ -182,7 +188,10 @@ _parse_trojan() {
         
         local target_sni="${sni:-$host}"
         target_sni="${target_sni:-$server}"
-        outbound=$(echo "$outbound" | jq --arg sni "$target_sni" '.tls = {enabled:true, server_name:$sni}')
+        
+        local is_insecure="false"
+        [[ "$insecure" == "1" || "$insecure" == "true" ]] && is_insecure="true"
+        outbound=$(echo "$outbound" | jq --arg sni "$target_sni" --argjson ins "$is_insecure" '.tls = {enabled:true, server_name:$sni, insecure:$ins}')
         
         echo "$outbound"
     fi
