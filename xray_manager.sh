@@ -432,6 +432,17 @@ EOF
     [ -f "$XRAY_METADATA" ] || echo '{}' > "$XRAY_METADATA"
 }
 
+_check_and_fix_xray_listen() {
+    [ -f "$XRAY_CONFIG" ] || return 1
+    if jq -e '.inbounds[]? | select(.listen == "0.0.0.0")' "$XRAY_CONFIG" >/dev/null 2>&1; then
+        if _atomic_modify_json "$XRAY_CONFIG" '(.inbounds[]? | select(.listen == "0.0.0.0") | .listen) = "::"'; then
+            _success "已将既有 Xray 入站监听从 0.0.0.0 升级为 ::，支持 IPv4/IPv6 双栈。"
+            return 0
+        fi
+    fi
+    return 1
+}
+
 _view_xray_log() {
     if [ "$INIT_SYSTEM" == "systemd" ]; then
         journalctl -u xray -n 50 --no-pager -f
@@ -593,7 +604,7 @@ _add_vless_reality_vision() {
     local inbound=$(jq -n --arg tag "$tag" --argjson port "$port" --arg uuid "$uuid" --arg flow "$flow" --argjson stream "$stream" \
         '{
             "tag": $tag,
-            "listen": "0.0.0.0",
+            "listen": "::",
             "port": $port,
             "protocol": "vless",
             "settings": {
@@ -656,7 +667,7 @@ _add_vless_grpc_reality() {
     stream=$(echo "$stream" | jq --arg svc "$service_name" '. + {grpcSettings: {serviceName: $svc}}')
     
     local inbound=$(jq -n --arg tag "$tag" --argjson port "$port" --arg uuid "$uuid" --argjson stream "$stream" \
-        '{tag:$tag, listen:"0.0.0.0", port:$port, protocol:"vless",
+        '{tag:$tag, listen:"::", port:$port, protocol:"vless",
           settings:{clients:[{id:$uuid, flow:""}], decryption:"none"},
           streamSettings:$stream}')
     
@@ -711,7 +722,7 @@ _add_trojan_xhttp_reality() {
     stream=$(echo "$stream" | jq --arg p "$path" '. + {xhttpSettings: {path: $p}}')
     
     local inbound=$(jq -n --arg tag "$tag" --argjson port "$port" --arg pw "$password" --argjson stream "$stream" \
-        '{tag:$tag, listen:"0.0.0.0", port:$port, protocol:"trojan",
+        '{tag:$tag, listen:"::", port:$port, protocol:"trojan",
           settings:{clients:[{password:$pw}]},
           streamSettings:$stream}')
     
@@ -762,7 +773,7 @@ _add_trojan_grpc_reality() {
     stream=$(echo "$stream" | jq --arg svc "$service_name" '. + {grpcSettings: {serviceName: $svc}}')
     
     local inbound=$(jq -n --arg tag "$tag" --argjson port "$port" --arg pw "$password" --argjson stream "$stream" \
-        '{tag:$tag, listen:"0.0.0.0", port:$port, protocol:"trojan",
+        '{tag:$tag, listen:"::", port:$port, protocol:"trojan",
           settings:{clients:[{password:$pw}]},
           streamSettings:$stream}')
     
@@ -926,7 +937,7 @@ _add_vless_h2_tls() {
         --arg cert "$cert_path" --arg key "$key_path" --arg sn "$sni" --arg pa "$path" \
         '{
             tag: $tag,
-            listen: "0.0.0.0",
+            listen: "::",
             port: $port,
             protocol: "vless",
             settings: {
@@ -1008,7 +1019,7 @@ _add_vless_grpc_tls() {
         --arg cert "$cert_path" --arg key "$key_path" --arg sn "$sni" --arg svc "$service_name" \
         '{
             tag: $tag,
-            listen: "0.0.0.0",
+            listen: "::",
             port: $port,
             protocol: "vless",
             settings: {
@@ -1092,7 +1103,7 @@ _add_trojan_grpc_tls() {
         --arg cert "$cert_path" --arg key "$key_path" --arg sn "$sni" --arg svc "$service_name" \
         '{
             tag: $tag,
-            listen: "0.0.0.0",
+            listen: "::",
             port: $port,
             protocol: "trojan",
             settings: {
@@ -1371,6 +1382,10 @@ _xray_menu() {
         _error "Xray 核心未安装！请返回主菜单，通过【核心管理】-> [14] 进行安装。"
         read -p "按回车键返回..."
         return
+    fi
+    _init_xray_config
+    if _check_and_fix_xray_listen; then
+        _manage_xray_service "restart"
     fi
 
     while true; do
